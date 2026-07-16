@@ -83,6 +83,12 @@ class TestMechanicalValidation:
         assert env.conn.execute(
             "SELECT COUNT(*) FROM callback_events WHERE event_id='cb_bad'").fetchone()[0] == 1
 
+    def test_non_ascii_nonce_invalid_not_crash(self, env):
+        p = member_pending(env)
+        r = env.approval.process_event(cb(p, event_id="cb_u", nonce="坏心思 nonce"))
+        assert r == "invalid"
+        assert pending_row(env, p["pending_id"])["state"] == "pending"
+
     def test_unknown_pending_invalid(self, env):
         p = member_pending(env)
         fake = dict(p)

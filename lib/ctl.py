@@ -66,22 +66,27 @@ def hook_command(name):
 
 def hooks_status():
     p = paths.settings_json_path()
-    st = {"stop": False, "session_end": False, "settings_path": str(p)}
+    st = {"stop": False, "session_end": False, "settings_path": str(p),
+          "other_stop_hooks": []}
     try:
         obj = json.loads(p.read_text())
     except (OSError, ValueError):
         return st
     hooks = obj.get("hooks") or {}
 
-    def has(event, needle):
+    def commands(event):
         for entry in hooks.get(event) or []:
             for h in (entry or {}).get("hooks") or []:
-                if needle in (h or {}).get("command", ""):
-                    return True
-        return False
+                cmd = (h or {}).get("command", "")
+                if cmd:
+                    yield cmd
 
-    st["stop"] = has("Stop", "feishu-bridge/hooks/stop_hook.py")
-    st["session_end"] = has("SessionEnd", "feishu-bridge/hooks/session_end.py")
+    st["stop"] = any("feishu-bridge/hooks/stop_hook.py" in c for c in commands("Stop"))
+    st["session_end"] = any("feishu-bridge/hooks/session_end.py" in c
+                            for c in commands("SessionEnd"))
+    # 4.7 已声明限制:与阻断型 Stop hook 共存 → 安装时检测+警告(重复组风险)
+    st["other_stop_hooks"] = [c for c in commands("Stop")
+                              if "feishu-bridge/hooks/stop_hook.py" not in c]
     return st
 
 

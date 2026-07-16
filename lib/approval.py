@@ -140,7 +140,12 @@ class Approval:
             "SELECT * FROM pendings WHERE pending_id=?", (pid,)).fetchone()
         if pending is None:
             return False, None
-        if not hmac.compare_digest(str(pending["nonce"]), nonce):
+        try:
+            same = hmac.compare_digest(str(pending["nonce"]).encode("utf-8"),
+                                       nonce.encode("utf-8"))
+        except (UnicodeError, TypeError):
+            same = False
+        if not same:
             return False, None
         if ev.get("operator_id") != self.cfg["owner_open_id"]:
             return False, None

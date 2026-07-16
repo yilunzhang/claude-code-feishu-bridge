@@ -56,6 +56,15 @@ class TestHooks:
         st = ctl.hooks_status()
         assert st["stop"] and st["session_end"]
 
+    def test_other_stop_hooks_detected(self, data_dir):
+        p = paths.settings_json_path()
+        snip = json.loads(ctl.hooks_snippet())
+        snip["hooks"]["Stop"].append(
+            {"hooks": [{"type": "command", "command": "python3 /x/other_blocking_hook.py"}]})
+        p.write_text(json.dumps(snip))
+        st = ctl.hooks_status()
+        assert st["stop"] and st["other_stop_hooks"] == ["python3 /x/other_blocking_hook.py"]
+
     def test_snippet_shape(self, data_dir):
         snip = json.loads(ctl.hooks_snippet())
         stop_cmd = snip["hooks"]["Stop"][0]["hooks"][0]["command"]

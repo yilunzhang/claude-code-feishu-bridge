@@ -58,6 +58,9 @@ def cmd_preflight(args):
             "手动把 hooks 片段合入 ~/.claude/settings.json(见 hooks_snippet),然后重启 CC 再重跑 bind;"
             "本工具绝不代写 settings.json")
         res["hooks_snippet"] = ctl.hooks_snippet()
+    if hooks.get("other_stop_hooks"):
+        res["warning"] = ("检测到其它 Stop hook(可能是阻断型):同一 turn 可能触发多次 Stop,"
+                          "普通 turn 存在重复转发组风险(plan 4.7 已声明限制;bind turn 有链闩保护)")
     out(res, 0 if ready else 3)
 
 
