@@ -16,7 +16,8 @@ from lib.daemon_core import ConsumerManager, DaemonCore  # noqa: E402
 from lib.inbound import Inbound  # noqa: E402
 from lib.outbound import Outbound  # noqa: E402
 from lib.recovery import Recovery  # noqa: E402
-from lib.runner import LarkRunner, parse_envelope  # noqa: E402
+from lib.fingerprint import FingerprintGate  # noqa: E402
+from lib.runner import LarkRunner  # noqa: E402
 
 
 def log_line(msg):
@@ -26,21 +27,6 @@ def log_line(msg):
         util.append_log_line(paths.daemon_log_path(), f"{ts} {msg}")
     except OSError:
         pass
-
-
-def verify_fingerprint(runner, cfg):
-    """profile/app_id 指纹钉死启动校验(§5)。确证不符 → mismatch;探测失败 → unknown。"""
-    res = runner.run(["auth", "status"], timeout_s=20)
-    env = parse_envelope(res.stdout)
-    if res.rc != 0 or not isinstance(env, dict):
-        return "unknown"
-    app_id = env.get("appId")
-    owner = ((env.get("identities") or {}).get("user") or {}).get("openId")
-    if app_id and app_id != cfg["app_id"]:
-        return "mismatch"
-    if owner and owner != cfg["owner_open_id"]:
-        return "mismatch"
-    return "ok"
 
 
 def main():
@@ -60,13 +46,16 @@ def main():
     conn = db.connect(paths.db_path(), busy_timeout_ms=constants.BUSY_TIMEOUT_DAEMON_MS)
     db.init_schema(conn, paths.schema_path())
     runner = LarkRunner(cfg["profile"])
-    fp = verify_fingerprint(runner, cfg)
-    if fp == "mismatch":
+    # 修复项1:指纹/版本门 fail-closed(缺字段≠ok;unknown/版本不符 → 出站停摆+退避重探)
+    gate = FingerprintGate(conn, cfg, runner, clock)
+    state = gate.startup()
+    if state == "mismatch":
         log_line("refuse start: identity fingerprint mismatch (profile/app_id/owner)")
         db.set_state(conn, "last_error", "fingerprint mismatch — daemon refused to start")
         return 3
-    if fp == "unknown":
-        log_line("warn: identity probe failed at startup; continuing (consumers will retry)")
+    if state == "degraded":
+        log_line(f"degraded start: outbound gated "
+                 f"({db.get_state(conn, 'outbound_gate')}); 入站照常入库,带退避重探")
 
     prober = procs.SystemProber()
     inbound = Inbound(conn, cfg, runner, clock, paths.media_root())
@@ -95,6 +84,9 @@ def main():
 
     db.set_state(conn, "daemon_pid", os.getpid())
     db.set_state(conn, "daemon_started_at", clock.wall_ms())
+    # 修复项5:记录本进程 (pid, ps lstart) 供 ensure-daemon 挂死接管做精确身份匹配
+    ident = procs.self_identity(prober, os.getpid())
+    db.set_state(conn, "daemon_proc_start", ident[1] if ident else "")
     outbound.startup_scan()
     recovery.slow_tick()
     mgr.start_all()
@@ -103,6 +95,7 @@ def main():
         while not stop["flag"]:
             mgr.poll(1.0)
             core.loop_iteration()
+            gate.tick()  # degraded 时按退避重探,全 ok 自动开门
             mgr.tick()
     finally:
         log_line("daemon shutting down")

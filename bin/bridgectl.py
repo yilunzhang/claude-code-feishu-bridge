@@ -125,7 +125,7 @@ def cmd_ensure_daemon(args):
 def cmd_doctor(args):
     cfg = configmod.require_config()
     runner = LarkRunner(cfg["profile"])
-    res = ctl.doctor(runner, args.chat_id, SystemClock())
+    res = ctl.doctor(runner, args.chat_id, SystemClock(), cfg=cfg)
     out(res, 0 if res.get("ok") else 2)
 
 

@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """listener 进程(persistent Monitor 内运行):`python3 bin/listener.py <binding_id>`。
 职责见 lib/listener_core.py;本文件只做真实依赖装配 + 主循环。"""
-import fcntl
 import os
 import pathlib
 import subprocess
@@ -10,31 +9,15 @@ import time
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
-from lib import constants, db, paths, procs, util  # noqa: E402
+from lib import constants, ctl, db, paths, procs, util  # noqa: E402
 from lib.clock import SystemClock  # noqa: E402
 from lib.listener_core import ListenerCore  # noqa: E402
 
 
-def daemon_alive_probe():
-    lock = paths.lock_path()
-    if not lock.exists():
-        return False
-    fd = os.open(str(lock), os.O_RDWR)
-    try:
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError:
-            return True  # 锁被 daemon 长持
-        fcntl.flock(fd, fcntl.LOCK_UN)
-        return False
-    finally:
-        os.close(fd)
-
-
 def ensure_daemon():
-    ctl = paths.skill_root() / "bin" / "bridgectl.py"
+    ctl_py = paths.skill_root() / "bin" / "bridgectl.py"
     subprocess.Popen(
-        [sys.executable, str(ctl), "ensure-daemon"],
+        [sys.executable, str(ctl_py), "ensure-daemon"],
         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL, start_new_session=True)
 
@@ -59,7 +42,8 @@ def main():
     me_start = ident[1] if ident else f"unknown-{me_pid}"
     core = ListenerCore(conn, binding_id, SystemClock(), prober,
                         me_pid=me_pid, me_start=me_start, printer=printer,
-                        daemon_alive_probe=daemon_alive_probe,
+                        # 修复项5:探活升级为 锁+心跳新鲜(挂死 daemon 也触发自愈接管)
+                        daemon_alive_probe=lambda: ctl.daemon_healthy(conn),
                         ensure_daemon=ensure_daemon)
     consecutive_errors = 0
     while True:

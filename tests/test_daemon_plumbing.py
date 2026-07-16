@@ -122,3 +122,64 @@ class TestConsumerManagerSubprocess:
         mgr.tick()
         assert len([s for s in statuses if s[1] == "spawned"]) == spawned_before + 1
         mgr.shutdown()
+
+
+CHILD_STDOUT_CLOSE = (
+    "import sys,os,time\n"
+    "sys.stderr.write('[event] ready event_key=x\\n'); sys.stderr.flush()\n"
+    "os.close(1)\n"
+    "time.sleep(30)\n")
+
+CHILD_PARTIAL = (
+    "import sys\n"
+    "sys.stdout.write('{\"partial\":'); sys.stdout.flush()\n")
+
+
+class TestConsumerRespawnHygiene:
+    """修复项7:任一流 EOF → 完整 teardown(kill+reap+双流关闭)后才 respawn;buffers 清空。"""
+
+    def test_stdout_eof_full_teardown_kills_and_reaps(self, env):
+        import sys as _sys
+        lines, statuses = [], []
+        clock = FakeClock()
+        mgr = ConsumerManager(
+            "main", clock, on_line=lambda k, l: lines.append(l),
+            on_status=lambda k, s, d: statuses.append(s), keys=("k1",),
+            argv_builder=lambda key: [_sys.executable, "-u", "-c", CHILD_STDOUT_CLOSE])
+        mgr.start_all()
+        c = mgr.consumers["k1"]
+        proc = c.proc
+        deadline = time.time() + 5
+        while time.time() < deadline and not c.exited:
+            mgr.poll(0.2)
+            mgr.tick()
+        assert c.exited is True
+        assert proc.poll() is not None  # 进程被 kill 且已 reap(不是只关一条流)
+        mgr.shutdown()
+
+    def test_respawn_clears_partial_buffers(self, env):
+        import sys as _sys
+        lines = []
+        clock = FakeClock()
+        scripts = [CHILD_PARTIAL, CHILD_OK]
+
+        def build(key):
+            return [_sys.executable, "-u", "-c", scripts.pop(0)]
+
+        mgr = ConsumerManager(
+            "main", clock, on_line=lambda k, l: lines.append(l),
+            on_status=lambda k, s, d: None, keys=("k1",), argv_builder=build)
+        mgr.start_all()
+        c = mgr.consumers["k1"]
+        deadline = time.time() + 5
+        while time.time() < deadline and not c.exited:
+            mgr.poll(0.2)
+            mgr.tick()
+        assert lines == []  # 半行不外泄
+        clock.tick(120_000)
+        mgr.tick()  # respawn(buffers 已清)
+        deadline = time.time() + 5
+        while time.time() < deadline and len(lines) < 2:
+            mgr.poll(0.2)
+        mgr.shutdown()
+        assert json.loads(lines[0]) == {"n": 1}  # 无旧半行拼接污染

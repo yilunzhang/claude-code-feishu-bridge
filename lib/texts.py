@@ -31,6 +31,7 @@ LC_CLOSED = {
     "listener_never_ready": "❌ 绑定失败(listener 未就绪)。请在 CC 里重试 /feishu-bridge bind。",
     "bind_failed": "❌ 绑定未完成,请在 CC 里重试 /feishu-bridge bind。",
     "bind_timeout": "⌛ 绑定确认超时,已取消。请在 CC 里重试 /feishu-bridge bind。",
+    "bind_superseded": "🔁 旧的绑定请求已被同一 CC 实例新发起的 bind 取代。",
 }
 
 

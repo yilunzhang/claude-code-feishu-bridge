@@ -23,11 +23,16 @@ class Outbound:
 
     def tick(self, budget=constants.OUTBOUND_BATCH):
         now = self.clock.wall_ms()
+        # 修复项1:指纹/版本门 degraded → 出站停摆(入站照常入库;门由 FingerprintGate 管理)
+        gate = db.get_state(self.conn, "outbound_gate", "ok") or "ok"
+        if gate != "ok":
+            return 0
         rows = self.conn.execute(
-            "SELECT * FROM outbound_jobs WHERE state='pending' "
+            "SELECT * FROM outbound_jobs WHERE (state='pending' "
+            "AND (next_attempt_at IS NULL OR next_attempt_at<=?)) "
             "OR (state='unknown' AND attempt_count<? AND next_attempt_at IS NOT NULL "
             "AND next_attempt_at<=?) ORDER BY job_seq",
-            (constants.MAX_SEND_ATTEMPTS, now)).fetchall()
+            (now, constants.MAX_SEND_ATTEMPTS, now)).fetchall()
         sends = 0
         for job in rows:
             if sends >= budget:
@@ -45,12 +50,14 @@ class Outbound:
                 "SELECT * FROM outbound_jobs WHERE job_id=?", (job["job_id"],)).fetchone()
             if fresh is None or fresh["state"] not in ("pending", "unknown"):
                 return "gone"
+            now = self.clock.wall_ms()
             if fresh["state"] == "unknown":
-                now = self.clock.wall_ms()
                 if fresh["attempt_count"] >= constants.MAX_SEND_ATTEMPTS:
                     return "skip"
                 if fresh["next_attempt_at"] is None or fresh["next_attempt_at"] > now:
                     return "skip"
+            elif fresh["next_attempt_at"] is not None and fresh["next_attempt_at"] > now:
+                return "skip"  # 重臂退避(修复项3):pending 也尊重 next_attempt_at
             order = self._order_gate(fresh)
             if order == "skip":
                 return "skip"
@@ -199,7 +206,9 @@ class Outbound:
                 ["im", "reactions", "create", "--as", "bot", "--params", params,
                  "--data", data], timeout_s=constants.SEND_TIMEOUT_S)
             env = runner_mod.parse_envelope(res.stdout)
-            if res.rc == 0 and runner_mod.envelope_ok(env):
+            # 修复项9:成功必须解析出 .data.reaction_id(F10:缺字段=非成功)
+            if res.rc == 0 and runner_mod.envelope_ok(env) \
+                    and runner_mod.data_of(env).get("reaction_id"):
                 return ("sent", None)
             return ("failed", "reaction failed")  # 失败即 failed 不重试(4.5;S11 幂等)
         if kind == "approval_card":
@@ -219,7 +228,22 @@ class Outbound:
                 return ("sent", mid)
             return ("unknown", "ok-without-message_id")
         if env is not None and env.get("ok") is False and env.get("code") is not None:
-            return ("failed", f"code={env.get('code')} {env.get('msg', '')}".strip())
+            return (classify_error_code(env.get("code")),
+                    f"code={env.get('code')} {env.get('msg', '')}".strip())
         if res.timed_out:
             return ("unknown", "timeout")
         return ("unknown", f"rc={res.rc} unparseable-envelope")
+
+
+def classify_error_code(code):
+    """修复项4:表驱动错误分类。永久集→failed;瞬态集→unknown(同 key 自动重试仍≤1);
+    未知 code→unknown(留人工,status 高亮)。"""
+    try:
+        code = int(code)
+    except (TypeError, ValueError):
+        return "unknown"
+    if code in constants.PERMANENT_SEND_CODES:
+        return "failed"
+    if code in constants.TRANSIENT_SEND_CODES:
+        return "unknown"
+    return "unknown"

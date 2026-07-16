@@ -111,23 +111,27 @@ bind 完整握手需要 CC 侧:起 persistent Monitor 跑 `bin/listener.py <bind
 cd ~/.claude/skills/feishu-bridge && python3 -m pytest tests/ -q
 ```
 
-全程离线:lark-cli 经可注入 runner(fake 按本机实测契约造形),事件流=可注入行迭代器,进程探测/时钟均可注入。覆盖 plan §6 全矩阵(DDL 真跑、bind-turn 双 Stop 链闩、双 listener epoch 抢占、审批崩溃缝重放、inbox 钉死、waiting_binding 激活重过审批门、pending_bind 超时、per-kind 守卫、chunk 组内/组间序、判死矩阵含睡眠宽限与时钟回拨、unbind 级联+线性化、限速配额、sending→unknown、callback 单事务、ENOSPC)。
+全程离线:lark-cli 经可注入 runner(fake 按本机实测契约造形),事件流=可注入行迭代器,进程探测/时钟均可注入。覆盖 plan §6 全矩阵(DDL 真跑、bind-turn 双 Stop 链闩、双 listener epoch 抢占、审批崩溃缝重放、inbox 钉死、waiting_binding 激活重过审批门、pending_bind 超时、per-kind 守卫、chunk 组内/组间序、判死矩阵含睡眠宽限与时钟回拨、unbind 级联+线性化、限速配额、sending→unknown、callback 单事务、ENOSPC)+ 指纹/版本门、bind 自愈(bind_superseded)、卡片重臂、daemon 挂死接管、consumer respawn 卫生。
+
+**已实测契约(leader 2026-07-16 真机验证)**:lark-cli = **1.0.66**;`+messages-reply --msg-type interactive --content <card> --idempotency-key` → `ok:true` + `.data.message_id`,同 key 幂等同 id(审批卡片走此路径,fake 契约与真机一致);S3(hook/skill 进程 ppid 链上溯解析 CC 实例)已在真实进程树验证通过。
 
 ## 已知限制(plan §8 + 诚实语义)
 
 - **v1 不做**:thread 出站回复(审批卡的 reply 除外)、reaction 快捷审批、消息编辑/撤回跟踪、topic 群、离线自动补投(daemon 停摆期间的消息**不重放**,S6 已证;LaunchAgent 待决 D1)、长输出转文件、卡片原地更新(晚点击无卡片刷新,结果以文本通知)、原子换绑、消费级 ACK、post 内嵌图片(只取文本)、多 profile 多桥。
 - **投递语义**:delivery `emitted` = 已写入 Monitor stdout 管道;到模型 = at-least-once(payload 带 message_id,session 按 id 跳重)。Monitor 可能合并连发的行。
 - **unbind 线性化**:以各 CAS 提交为线性化点;unbind 提交前已进入 `sending` 的 job / 已 `leased` 的 delivery 允许其后完成(各至多 1 件在途),此后零新增。
-- **阻断型 Stop hook 共存**:同一 turn 会触发多次 Stop。bind turn 有链闩全抑制;普通 turn 因 turn_group 无法跨 Stop 归并,存在重复转发组风险(preflight 检测+警告)。
-- **发送结果 `unknown`**:超时/信封缺字段会同 key 自动重试一次(服务端幂等已证);二次仍 unknown 则停发并阻塞同绑定后续 turn(status 高亮),需人工看一眼群里到底发没发。
+- **阻断型 Stop hook 共存**:同一 turn 会触发多次 Stop。bind turn 有链闩全抑制;普通 turn 因 turn_group 无法跨 Stop 归并,存在重复转发组风险(preflight 检测+警告;S7 语义 A2 联合验收确认,声明限制不重设计)。
+- **发送结果 `unknown`**:超时/信封缺字段/瞬态错误码会同 key 自动重试一次(服务端幂等已证);二次仍 unknown 则停发并阻塞同绑定后续 turn(status 高亮),需人工看一眼群里到底发没发。
+- **错误分类 = 表驱动**:`ok:false` 按 `lib/constants.py` 的 `PERMANENT_SEND_CODES`(权限/成员关系/能力/目标不存在 → failed 不重试)/ `TRANSIENT_SEND_CODES`(频控/令牌自刷 → unknown,≤1 次重试)分类;**未知 code → unknown 留人工**。表可维护,新 code 实测后补入。
+- **审批卡片发送失败自愈**:failed 的 approval_card 由恢复工人退避重臂(总尝试 ≤5 次),之后放弃并在 status 高亮(`given_up_approval_cards`)——member 消息不再无声悬挂整个审批 TTL。
+- **指纹/版本门(fail-closed)**:daemon 启动与运行期校验 lark-cli 身份(appId/owner)与版本;身份确证不符=拒启;身份未验证/版本不符=**出站停摆**(入站照常入库),带退避重探;版本升级后跑 `doctor` 全链自检通过即自动重钉 `cli_version`。
 - **owner 附件物化失败**:静默落 `failed`(status 计数),不回群提示(member 路径有失败通知)。
-- **错误分类**:lark-cli 信封 `ok:false` 一律按确定性失败(failed,不重试)处理,未细分 4xx/5xx。
 - 事件到达依赖 lark-cli event bus 的 WS 在线;网络长断期消息丢失(同上不重放)。
 
 ## 故障排查
 
 1. `python3 $B status`:daemon `last_loop_age_s` 应 <5s;consumer 应 ready;看 `outbound_jobs.unknown/failed` 与 `counters`。
-2. daemon 不动 → `tail -50 ~/.claude/data/feishu-bridge/daemon.log`;手动 `python3 $B ensure-daemon`。
+2. daemon 不动 → `tail -50 ~/.claude/data/feishu-bridge/daemon.log`;手动 `python3 $B ensure-daemon`(锁被持有但心跳陈旧 >60s = 挂死,会按记录的 pid+启动时间精确匹配后 SIGTERM 并接管重启;listener 的探活同样以"锁+心跳新鲜"为准,会自动触发该自愈)。`status.outbound_gate` 非 `ok` = 出站停摆(身份未验证/版本不符),看 `gate_hint`。
 3. 转发缺失 → `hook_drops.log`(hook fail-closed 记录);确认 hooks 已装且 CC 重启过;确认绑定 active(`status`)。
 4. 群消息进不来 → bot 是否在群里、是否真的 @ 了 bot(要结构化 @,转发/引用里的假 @ 无效)、VPN/WS 是否在线(daemon.log 的 consumer 状态)。
 5. 彻底重置:unbind 全部绑定 → 杀 daemon(`pkill -f feishu-bridge/bin/daemon.py`,SIGTERM)→ 删 `~/.claude/data/feishu-bridge/`(会丢历史)→ 重新 bootstrap。

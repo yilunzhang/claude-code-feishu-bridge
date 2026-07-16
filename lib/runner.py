@@ -1,5 +1,5 @@
 """lark-cli 子进程底座(I4):argv 无 shell、显式 --profile、超时+进程组 SIGTERM、
-并发排空 stdout/stderr(communicate 内部双线程)。REST 契约:以解析出预期字段为准,缺=UNKNOWN。"""
+并发排空 stdout/stderr(communicate 双管道排空,POSIX 下为 selector 单线程实现)。REST 契约:以解析出预期字段为准,缺=UNKNOWN。"""
 import json
 import os
 import signal

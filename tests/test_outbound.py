@@ -347,3 +347,74 @@ class TestOrdering:
         env.outbound.tick()
         assert job_state(env, "notice:om_1:unbound")["state"] == "unknown"
         assert job_state(env, "notice:om_2:unbound")["state"] == "pending"  # 同 chat 按序
+
+
+class TestErrorClassification:
+    """修复项4:表驱动错误分类:永久集→failed;瞬态集→unknown(仍≤1 次同 key 重试);未知→unknown。"""
+
+    def _job(self, env):
+        bid = env.make_binding(status="active")
+        return mk_job(env, binding_id=bid, key="turn:g:0", turn_group="g", chunk_index=0)
+
+    def test_permanent_code_failed(self, env):
+        self._job(env)
+        env.runner.on_prefix(["im", "+messages-send"], lambda a, c: err_envelope(230002))
+        env.outbound.tick()
+        assert job_state(env, "turn:g:0")["state"] == "failed"
+
+    def test_transient_code_unknown_with_single_retry(self, env):
+        self._job(env)
+        calls = {"n": 0}
+
+        def fn(args, cwd):
+            calls["n"] += 1
+            return err_envelope(230020, "req too frequent")  # 频控=瞬态
+
+        env.runner.on_prefix(["im", "+messages-send"], fn)
+        env.outbound.tick()
+        row = job_state(env, "turn:g:0")
+        assert row["state"] == "unknown" and row["next_attempt_at"] is not None
+        env.clock.tick(constants.UNKNOWN_RETRY_DELAY_MS + 1)
+        env.outbound.tick()
+        env.clock.tick(constants.UNKNOWN_RETRY_DELAY_MS + 1)
+        env.outbound.tick()
+        assert calls["n"] == 2  # 同 key 自动重试仍 ≤1 次
+        assert job_state(env, "turn:g:0")["state"] == "unknown"
+
+    def test_unknown_code_stays_unknown_for_manual(self, env):
+        self._job(env)
+        env.runner.on_prefix(["im", "+messages-send"], lambda a, c: err_envelope(123456789))
+        env.outbound.tick()
+        assert job_state(env, "turn:g:0")["state"] == "unknown"
+
+
+class TestPendingBackoffGate:
+    def test_pending_with_future_next_attempt_not_sent(self, env):
+        """修复项3配套:重臂后的 pending 带 next_attempt_at,未到期不发。"""
+        bid = env.make_binding(status="active")
+        mk_job(env, binding_id=bid, key="turn:g:0", turn_group="g", chunk_index=0)
+        env.conn.execute(
+            "UPDATE outbound_jobs SET next_attempt_at=? WHERE idempotency_key='turn:g:0'",
+            (env.clock.wall_ms() + 60_000,))
+        arm_send_ok(env)
+        assert env.outbound.tick() == 0
+        env.clock.tick(60_001)
+        assert env.outbound.tick() == 1
+
+
+class TestReactionContract:
+    def test_reaction_ok_without_reaction_id_is_failed(self, env):
+        """修复项9:reaction 成功必须解析出 .data.reaction_id,缺=failed(仍不重试)。"""
+        bid = env.make_binding(status="active")
+        env.conn.execute(
+            "INSERT INTO inbox(event_id,message_id,chat_id,binding_id,state,ts) "
+            "VALUES('ev_1','om_1',?,?,'enqueued',0)", (CHAT, bid))
+        env.conn.execute(
+            "INSERT INTO deliveries(binding_id,message_id,payload_json,state) "
+            "VALUES(?,'om_1','{}','enqueued')", (bid,))
+        seq = env.conn.execute("SELECT delivery_seq FROM deliveries").fetchone()[0]
+        env.runner.on_prefix(["im", "reactions", "create"], lambda a, c: ok_envelope({}))
+        mk_job(env, kind="receipt_reaction", key=f"rc:{seq}", binding_id=bid,
+               ref_delivery_seq=seq, ref_message_id="om_1", body="GLANCE")
+        env.outbound.tick()
+        assert job_state(env, f"rc:{seq}")["state"] == "failed"

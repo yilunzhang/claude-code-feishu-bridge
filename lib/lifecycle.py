@@ -13,12 +13,24 @@ class BindConflict(Exception):
 
 def create_binding(conn, *, chat_id, chat_name, cwd, cc_pid, cc_start, clock):
     """单事务:INSERT pending_bind + INSERT bindings(starting, session_id=NULL)。
-    b_chat/b_inst/pb_inst 任一命中即失败(1:1 与 TOCTOU 在此原子闭合,plan 4.1.4)。"""
+    b_chat/b_inst/pb_inst 任一命中即失败(1:1 与 TOCTOU 在此原子闭合,plan 4.1.4)。
+    修复项2(自愈):同 cc 实例残留的 starting 绑定/pending 行(如握手前 /clear)→
+    先在同一终止事务里 close(bind_superseded,映射 unbound 类)再插新行,
+    消除"10 分钟占位阻止 rebind";active 绑定绝不 supersede(仍要求显式 unbind)。"""
     now = clock.wall_ms()
     rid = util.new_id()
     nonce = util.new_nonce()
     try:
         with db.tx(conn):
+            stale = conn.execute(
+                "SELECT binding_id FROM bindings WHERE cc_pid=? AND cc_start=? "
+                "AND status='starting'", (cc_pid, cc_start)).fetchone()
+            if stale:
+                _terminate_in_tx(conn, stale[0], "bind_superseded", now)
+            # 孤儿 pending(无对应 starting 行的异常残留)同样清掉,防 pb_inst 卡插入
+            conn.execute(
+                "UPDATE pending_bind SET state='expired', latch_open=0 "
+                "WHERE cc_pid=? AND cc_start=? AND state='pending'", (cc_pid, cc_start))
             conn.execute(
                 "INSERT INTO pending_bind(request_id,chat_id,cwd,cc_pid,cc_start,nonce,"
                 "state,latch_open,created_at,expires_at) VALUES(?,?,?,?,?,?,'pending',0,?,?)",
@@ -96,7 +108,9 @@ def _terminate_in_tx(conn, binding_id, close_reason, now, new_status="closed",
         "UPDATE deliveries SET state='dropped' WHERE binding_id=? AND state='enqueued'",
         (binding_id,))
 
-    # 该绑定所有仍可重试的 job 全部 cancelled(先 cancel 再建通知 → 唯一豁免天然成立)
+    # 该绑定所有仍可重试(pending/unknown)的既有 job 全部 cancelled。
+    # 本次终止的 lifecycle_notice 是"唯一保留的既有 job 豁免"的实现方式=先 cancel 再新建;
+    # waiting 行的 inbound_notice 回执同理是本次终止事务新建的副作用(4.8),不属被豁免的存量。
     conn.execute(
         "UPDATE outbound_jobs SET state='cancelled' WHERE binding_id=? "
         "AND state IN ('pending','unknown')", (binding_id,))

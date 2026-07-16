@@ -16,15 +16,26 @@ def _existing(dest):
     return sorted(str(p) for p in dest.iterdir() if p.is_file() and not p.is_symlink())
 
 
+def _safe_id(x):
+    """修复项8:id 只作单层目录名;拒 '.'/'..'/点前缀(与 .tmp 约定冲突)/分隔符/NUL。"""
+    s = str(x)
+    if (not s or s in (".", "..") or s.startswith(".")
+            or "/" in s or os.sep in s or (os.altsep and os.altsep in s)
+            or "\x00" in s):
+        raise MediaError(f"bad media path id: {s!r}")
+    return s
+
+
 def materialize(runner, media_root, binding_id, message_id,
                 quota_bytes=None, timeout_s=constants.DOWNLOAD_TIMEOUT_S):
     if quota_bytes is None:
         quota_bytes = constants.MEDIA_MSG_QUOTA_BYTES
     media_root = pathlib.Path(media_root)
-    # 防穿越:id 只作单层目录名
-    if os.sep in str(binding_id) or os.sep in str(message_id):
-        raise MediaError("bad id")
-    dest = media_root / str(binding_id) / str(message_id)
+    dest = media_root / _safe_id(binding_id) / _safe_id(message_id)
+    # 修复项8:realpath 收容 —— 目标解析后必须仍在 media root 之下(挡 symlink 逃逸)
+    root_real = os.path.realpath(media_root)
+    if not os.path.realpath(dest).startswith(root_real + os.sep):
+        raise MediaError("media path escapes media root")
     if dest.is_dir():
         return _existing(dest)  # 幂等复用(此前成功过)
     tmp = None

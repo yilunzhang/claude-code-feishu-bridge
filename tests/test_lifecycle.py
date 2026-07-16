@@ -222,3 +222,54 @@ class TestActivation:
                                listener_beat_at=None,
                                confirmed_at=env.clock.wall_ms())
         assert lifecycle.activate_if_ready(env.conn, bid, env.clock) == "waiting"
+
+
+class TestBindSupersede:
+    """修复项2:同实例残留 starting/pending(如握手前 /clear)→ 同一终止事务 close(bind_superseded)再插新行。"""
+
+    def test_stale_starting_superseded_same_chat(self, env):
+        r1 = lifecycle.create_binding(env.conn, chat_id=CHAT, chat_name=None, cwd=None,
+                                      cc_pid=CC_PID, cc_start=CC_START, clock=env.clock)
+        make_pending_message(env, r1["binding_id"], "om_w", "waiting_binding")
+        # 同实例同群直接 rebind:不再被 10 分钟占位挡住
+        r2 = lifecycle.create_binding(env.conn, chat_id=CHAT, chat_name=None, cwd=None,
+                                      cc_pid=CC_PID, cc_start=CC_START, clock=env.clock)
+        old = env.conn.execute("SELECT * FROM bindings WHERE binding_id=?",
+                               (r1["binding_id"],)).fetchone()
+        assert old["status"] == "closed" and old["close_reason"] == "bind_superseded"
+        pb_old = env.conn.execute("SELECT * FROM pending_bind WHERE request_id=?",
+                                  (r1["binding_id"],)).fetchone()
+        assert pb_old["state"] == "expired" and pb_old["latch_open"] == 0
+        # 旧 waiting 行按 4.2.4 映射为 unbound(bind_superseded ∈ unbound 类)
+        assert env.inbox_row("om_w")["state"] == "unbound"
+        new = env.conn.execute("SELECT * FROM bindings WHERE binding_id=?",
+                               (r2["binding_id"],)).fetchone()
+        assert new["status"] == "starting"
+        pb_new = env.conn.execute("SELECT * FROM pending_bind WHERE request_id=?",
+                                  (r2["binding_id"],)).fetchone()
+        assert pb_new["state"] == "pending"
+
+    def test_supersede_across_chats(self, env):
+        r1 = lifecycle.create_binding(env.conn, chat_id="oc_A", chat_name=None, cwd=None,
+                                      cc_pid=CC_PID, cc_start=CC_START, clock=env.clock)
+        r2 = lifecycle.create_binding(env.conn, chat_id="oc_B", chat_name=None, cwd=None,
+                                      cc_pid=CC_PID, cc_start=CC_START, clock=env.clock)
+        old = env.conn.execute("SELECT * FROM bindings WHERE binding_id=?",
+                               (r1["binding_id"],)).fetchone()
+        assert old["close_reason"] == "bind_superseded"
+        assert env.conn.execute(
+            "SELECT chat_id FROM bindings WHERE binding_id=?",
+            (r2["binding_id"],)).fetchone()[0] == "oc_B"
+
+    def test_active_binding_not_superseded(self, env):
+        env.make_binding(status="active", chat_id="oc_other",
+                         cc_pid=CC_PID, cc_start=CC_START)
+        with pytest.raises(BindConflict) as ei:
+            lifecycle.create_binding(env.conn, chat_id=CHAT, chat_name=None, cwd=None,
+                                     cc_pid=CC_PID, cc_start=CC_START, clock=env.clock)
+        assert ei.value.code == "instance_busy"
+
+    def test_superseded_maps_unbound(self, env):
+        bid = env.make_binding(status="closed", close_reason="bind_superseded")
+        row = env.conn.execute("SELECT * FROM bindings WHERE binding_id=?", (bid,)).fetchone()
+        assert lifecycle.map_terminated_to_inbox_state(row) == "unbound"

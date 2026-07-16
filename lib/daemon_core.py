@@ -20,7 +20,8 @@ RAPID_EXIT_ALERT_THRESHOLD = 5
 
 class _Consumer:
     __slots__ = ("key", "proc", "out_buf", "err_buf", "ready", "restarts",
-                 "started_at", "next_restart_at", "backoff", "exited")
+                 "started_at", "next_restart_at", "backoff", "exited",
+                 "generation", "streams")
 
     def __init__(self, key):
         self.key = key
@@ -33,6 +34,8 @@ class _Consumer:
         self.next_restart_at = 0
         self.backoff = RESTART_BACKOFF_START_MS
         self.exited = True
+        self.generation = 0   # 进程代数(修复项7):stale selector 事件按代数丢弃
+        self.streams = ()
 
 
 class ConsumerManager:
@@ -59,7 +62,12 @@ class ConsumerManager:
             self._spawn(c, now)
 
     def _spawn(self, c, now):
+        # 修复项7:单消费者不变量 —— 旧进程必须已 teardown+reap 才允许 respawn
+        if c.proc is not None and c.proc.poll() is None:
+            return
         argv = self.argv_builder(c.key)
+        c.out_buf = b""   # respawn 卫生:清空半行缓冲,防跨代拼接污染
+        c.err_buf = b""
         try:
             c.proc = subprocess.Popen(
                 argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
@@ -73,10 +81,12 @@ class ConsumerManager:
         c.exited = False
         c.ready = False
         c.started_at = now
+        c.generation += 1
+        c.streams = (c.proc.stdout, c.proc.stderr)
         for stream, tag in ((c.proc.stdout, "stdout"), (c.proc.stderr, "stderr")):
             os.set_blocking(stream.fileno(), False)
-            self.selector.register(stream, selectors.EVENT_READ, (c, tag))
-        self.on_status(c.key, "spawned", f"pid={c.proc.pid}")
+            self.selector.register(stream, selectors.EVENT_READ, (c, tag, c.generation))
+        self.on_status(c.key, "spawned", f"pid={c.proc.pid} gen={c.generation}")
 
     # ------------------------------------------------------------------
     def poll(self, timeout_s):
@@ -87,23 +97,52 @@ class ConsumerManager:
         except OSError:
             return 0
         for key, _mask in events:
-            c, tag = key.data
+            c, tag, gen = key.data
+            if gen != c.generation or c.exited:
+                continue  # stale 代 / 已 teardown:残留就绪事件丢弃
             stream = key.fileobj
             try:
-                chunk = os.read(stream.fileno(), 65536)
+                fd = stream.fileno()
+            except ValueError:
+                continue  # 同批次内另一条流触发的 teardown 已关闭本流
+            try:
+                chunk = os.read(fd, 65536)
             except (BlockingIOError, InterruptedError):
                 continue
-            except OSError:
+            except (OSError, ValueError):
                 chunk = b""
             if chunk == b"":
-                try:
-                    self.selector.unregister(stream)
-                except (KeyError, ValueError):
-                    pass
-                self._mark_exited(c)
+                # 修复项7:任一流 EOF → 完整 teardown(双流关闭+kill+reap),不留半死进程
+                self._teardown(c)
                 continue
             n += self._feed(c, tag, chunk)
         return n
+
+    def _teardown(self, c):
+        """完整拆除一代 consumer:双流注销+关闭、SIGTERM(绝不 -9)、有界 reap。"""
+        for stream in c.streams:
+            try:
+                self.selector.unregister(stream)
+            except (KeyError, ValueError):
+                pass
+            try:
+                stream.close()
+            except OSError:
+                pass
+        c.streams = ()
+        if c.proc is not None and c.proc.poll() is None:
+            try:
+                os.killpg(os.getpgid(c.proc.pid), signal.SIGTERM)
+            except OSError:
+                try:
+                    c.proc.terminate()
+                except OSError:
+                    pass
+            try:
+                c.proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                pass  # 仍未退:_spawn 的单消费者门挡住 respawn,tick 会再 TERM
+        self._mark_exited(c)
 
     def _feed(self, c, tag, chunk):
         n = 0
@@ -152,16 +191,18 @@ class ConsumerManager:
                 pass
 
     def tick(self):
-        """重启到期的 dead consumer;探测静默退出的进程。"""
+        """重启到期的 dead consumer;探测静默退出的进程;催死赖着不走的旧代。"""
         now = self.clock.mono_ms()
         for c in self.consumers.values():
             if not c.exited and c.proc is not None and c.proc.poll() is not None:
-                for stream in (c.proc.stdout, c.proc.stderr):
-                    try:
-                        self.selector.unregister(stream)
-                    except (KeyError, ValueError):
-                        pass
-                self._mark_exited(c)
+                self._teardown(c)
+            if c.exited and c.proc is not None and c.proc.poll() is None:
+                # teardown 后仍存活(TERM 被忽略):再 TERM,绝不 -9;respawn 被单消费者门挡住
+                try:
+                    os.killpg(os.getpgid(c.proc.pid), signal.SIGTERM)
+                except OSError:
+                    pass
+                continue
             if c.exited and now >= c.next_restart_at:
                 self._spawn(c, now)
 

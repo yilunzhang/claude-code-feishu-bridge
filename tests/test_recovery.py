@@ -2,6 +2,8 @@
 import json
 import os
 
+import pytest
+
 from tests.conftest import APP_ID, CHAT, MEMBER, OWNER
 from tests.helpers import bot_mention, mget_snapshot, err_envelope, ok_envelope
 from lib import constants, db as dbmod, jobs
@@ -189,3 +191,73 @@ class TestLegacySending:
         row = env.conn.execute(
             "SELECT state FROM outbound_jobs WHERE idempotency_key='turn:g:0'").fetchone()
         assert row[0] == "unknown"
+
+
+class TestFailedCardRearm:
+    """修复项3:failed approval_card 重臂(CAS failed→pending + 退避,上限 5 次后放弃)。"""
+
+    def _failed_card(self, env, attempts=1):
+        from tests.test_approval import member_pending
+        p = member_pending(env)
+        key = jobs.key_card(p["pending_id"])
+        env.conn.execute(
+            "UPDATE outbound_jobs SET state='failed', attempt_count=?, error='code=230020' "
+            "WHERE idempotency_key=?", (attempts, key))
+        return p, key
+
+    def test_rearmed_with_backoff(self, env):
+        p, key = self._failed_card(env, attempts=1)
+        env.recovery.slow_tick()
+        j = env.conn.execute("SELECT * FROM outbound_jobs WHERE idempotency_key=?",
+                             (key,)).fetchone()
+        assert j["state"] == "pending"
+        assert j["next_attempt_at"] is not None and j["next_attempt_at"] > env.clock.wall_ms()
+        # 退避期内不发
+        from tests.helpers import ok_envelope
+        env.runner.on_prefix(["im", "+messages-reply"],
+                             lambda a, c: ok_envelope({"message_id": "om_card"}))
+        env.outbound.tick()
+        assert env.runner.calls_matching("im", "+messages-reply") == []
+        # 退避期过 → 发出
+        env.clock.tick(j["next_attempt_at"] - env.clock.wall_ms() + 1)
+        env.outbound.tick()
+        assert len(env.runner.calls_matching("im", "+messages-reply")) == 1
+
+    def test_gives_up_after_cap_counts_once(self, env):
+        p, key = self._failed_card(env, attempts=5)
+        env.recovery.slow_tick()
+        env.recovery.slow_tick()
+        j = env.conn.execute("SELECT state, error FROM outbound_jobs WHERE idempotency_key=?",
+                             (key,)).fetchone()
+        assert j["state"] == "failed" and j["error"] == "given-up"
+        assert int(dbmod.get_state(env.conn, "approval_card_given_up", "0")) == 1
+        rep_stuck = env.conn.execute(
+            "SELECT COUNT(*) FROM outbound_jobs WHERE kind='approval_card' "
+            "AND state='failed' AND error='given-up'").fetchone()[0]
+        assert rep_stuck == 1
+
+    def test_no_rearm_when_pending_decided(self, env):
+        p, key = self._failed_card(env, attempts=1)
+        env.conn.execute("UPDATE pendings SET state='expired' WHERE pending_id=?",
+                         (p["pending_id"],))
+        env.recovery.slow_tick()
+        assert env.conn.execute(
+            "SELECT state FROM outbound_jobs WHERE idempotency_key=?",
+            (key,)).fetchone()[0] == "failed"
+
+
+class TestRetentionSymlinkHardening:
+    def test_symlinked_media_dir_not_followed(self, env, tmp_path):
+        """修复项8:retention 遍历不跟随 symlink,绝不 rmtree 到 media root 之外。"""
+        bid = env.make_binding(status="active")
+        old = env.clock.wall_ms() - constants.RETENTION_MS - 1000
+        env.conn.execute(
+            "INSERT INTO inbox(event_id,message_id,chat_id,binding_id,state,ts) "
+            "VALUES('e_s','om_sym',?,?,'enqueued',?)", (CHAT, bid, old))
+        victim = tmp_path / "victim"
+        victim.mkdir()
+        (victim / "precious.txt").write_bytes(b"keep me")
+        (env.media_root / bid).mkdir(parents=True, exist_ok=True)
+        os.symlink(victim, env.media_root / bid / "om_sym")
+        env.recovery.slow_tick()
+        assert (victim / "precious.txt").exists()  # 受害目录不被清

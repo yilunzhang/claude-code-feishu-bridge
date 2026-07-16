@@ -6,7 +6,8 @@ import os
 
 from . import paths, util
 
-REQUIRED_KEYS = ("profile", "app_id", "bot_open_id", "owner_open_id")
+# cli_version 必填(修复项1):版本门以 config 钉死值为基准
+REQUIRED_KEYS = ("profile", "app_id", "bot_open_id", "owner_open_id", "cli_version")
 
 
 class ConfigError(Exception):

@@ -38,6 +38,7 @@ class Recovery:
         self.inbound.drive_waiting_rows()
         self._redrive_resolving(now)
         self._replenish_cards(now)
+        self._rearm_failed_cards(now)
         self._redrive_materializing(now)
         self._expire_pendings(now)
         lifecycle.expire_stale_pending_binds(self.conn, self.clock)
@@ -94,6 +95,29 @@ class Recovery:
                     "UPDATE pendings SET card_message_id=? "
                     "WHERE pending_id=? AND card_message_id IS NULL",
                     (job["sent_message_id"], p["pending_id"]))
+
+    def _rearm_failed_cards(self, now):
+        """修复项3:failed approval_card 重臂(修"member 消息悬挂到审批 TTL")。
+        CAS failed→pending + 退避 next_attempt_at;总尝试上限后放弃并 status 高亮(计一次)。"""
+        rows = self.conn.execute(
+            "SELECT o.* FROM outbound_jobs o JOIN pendings p ON p.pending_id=o.ref_pending_id "
+            "WHERE o.kind='approval_card' AND o.state='failed' "
+            "AND p.state='pending' AND p.card_message_id IS NULL").fetchall()
+        for j in rows:
+            if (j["attempt_count"] or 0) >= constants.CARD_REARM_MAX_ATTEMPTS:
+                with db.tx(self.conn):
+                    if db.cas(self.conn,
+                              "UPDATE outbound_jobs SET error='given-up' "
+                              "WHERE job_id=? AND state='failed' "
+                              "AND (error IS NULL OR error!='given-up')", (j["job_id"],)):
+                        db.bump_counter(self.conn, "approval_card_given_up")
+                continue
+            delay = min(
+                constants.CARD_REARM_BACKOFF_MS * (2 ** max((j["attempt_count"] or 1) - 1, 0)),
+                constants.CARD_REARM_BACKOFF_MAX_MS)
+            db.cas(self.conn,
+                   "UPDATE outbound_jobs SET state='pending', next_attempt_at=? "
+                   "WHERE job_id=? AND state='failed'", (now + delay, j["job_id"]))
 
     def _redrive_materializing(self, now):
         rows = self.conn.execute(
@@ -208,11 +232,13 @@ class Recovery:
             return
         for bdir in binding_dirs:
             bpath = os.path.join(media_root, bdir)
-            if not os.path.isdir(bpath):
+            # 修复项8:lstat 语义,不跟随 symlink(绝不清 media root 之外)
+            if os.path.islink(bpath) or not os.path.isdir(bpath):
                 continue
             for mdir in os.listdir(bpath):
                 mpath = os.path.join(bpath, mdir)
-                if not os.path.isdir(mpath) or mdir.startswith(".tmp"):
+                if os.path.islink(mpath) or not os.path.isdir(mpath) \
+                        or mdir.startswith("."):
                     continue
                 row = self.conn.execute(
                     "SELECT state, ts FROM inbox WHERE message_id=?", (mdir,)).fetchone()

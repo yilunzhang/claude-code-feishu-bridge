@@ -41,13 +41,16 @@ def bootstrap(runner, profile, clock):
     if not bot_open_id:
         raise configmod.ConfigError("bot/v3/info 未取到 .bot.open_id(--format ndjson)")
     ver = runner.run(["--version"], timeout_s=10)
+    cli_version = (ver.stdout or "").strip().splitlines()[0].strip() if (ver.stdout or "").strip() else None
+    if ver.rc != 0 or not cli_version:
+        raise configmod.ConfigError("lark-cli --version 探测失败:cli_version 必填(版本门基准)")
     cfg = {
         "profile": profile,
         "app_id": app_id,
         "bot_open_id": bot_open_id,
         "bot_name": bot_name,
         "owner_open_id": owner,
-        "cli_version": (ver.stdout or "").strip().splitlines()[0] if ver.stdout else None,
+        "cli_version": cli_version,
         "created_at": clock.wall_ms(),
     }
     with configmod.bootstrap_lock():
@@ -200,15 +203,20 @@ def status_report(conn, cfg, clock):
     counters = {}
     for key in ("hook_drop_count", "inbox_conflict_alerts", "inbox_cap_drops",
                 "malformed_event_lines", "event_processing_errors", "media_failed",
-                "resolve_deadline_failed"):
+                "resolve_deadline_failed", "approval_card_given_up"):
         v = db.get_state(conn, key)
         if v is not None:
             counters[key] = v
-    return {
+    gate = db.get_state(conn, "outbound_gate", "ok") or "ok"
+    given_up_cards = conn.execute(
+        "SELECT COUNT(*) FROM outbound_jobs WHERE kind='approval_card' "
+        "AND state='failed' AND error='given-up'").fetchone()[0]
+    rep = {
         "fingerprint": {k: cfg.get(k) for k in
                         ("profile", "app_id", "bot_open_id", "bot_name", "owner_open_id",
                          "cli_version")},
         "schema_version": db.get_state(conn, "schema_version"),
+        "outbound_gate": gate,
         "daemon": daemon,
         "consumers": consumers,
         "bindings": bindings,
@@ -216,7 +224,15 @@ def status_report(conn, cfg, clock):
         "deliveries": deliveries_by_state,
         "inbox": inbox_by_state,
         "counters": counters,
+        "given_up_approval_cards": given_up_cards,
     }
+    if gate == "degraded:version_mismatch":
+        rep["gate_hint"] = ("lark-cli 版本与 config.cli_version 不符,出站已停摆。"
+                            "跑 `bridgectl doctor --chat-id <测试群oc>` 全链自检通过后自动重钉版本;"
+                            "daemon 会在退避重探后自动放行(≤10min)。")
+    elif gate.startswith("degraded"):
+        rep["gate_hint"] = "身份指纹未验证(出站停摆),daemon 带退避重探;检查 VPN/lark-cli 登录。"
+    return rep
 
 
 # ---------------------------------------------------------------- daemon 拉起
@@ -236,36 +252,134 @@ def daemon_lock_held():
         os.close(fd)
 
 
-def ensure_daemon(wait_s=12, spawn=True):
-    if daemon_lock_held():
-        return "running"
-    if not spawn:
-        return "down"
+# 修复项5:daemon 挂死恢复。锁被持有但心跳陈旧(>HUNG_THRESHOLD)= 挂死 →
+# 按记录的 (daemon_pid, daemon_proc_start) 精确匹配后 SIGTERM → 等退出 → 接管重启;
+# 身份不匹配(pid 复用/无记录)绝不杀随机进程 → failed。
+HUNG_THRESHOLD_MS = 60_000
+_POLL_STEP_S = 0.3
+
+
+def daemon_healthy(conn, now_ms=None):
+    """listener/调用方探活:锁被持有 ∧ last_loop_at 新鲜(时钟回拨按新鲜处理)。"""
+    if not daemon_lock_held():
+        return False
+    try:
+        last = db.get_state(conn, "last_loop_at")
+    except Exception:
+        return False
+    if last is None:
+        return False
+    now = now_ms if now_ms is not None else int(time.time() * 1000)
+    return (now - int(last)) <= HUNG_THRESHOLD_MS  # 负值(回拨)=新鲜
+
+
+class DaemonSupervisor:
+    """依赖全注入的 ensure 逻辑(可测):lock_held()/read_state()/spawn()/kill(pid,sig)。"""
+
+    def __init__(self, *, lock_held, read_state, spawn, kill, prober,
+                 now_ms, sleep, wait_s=12):
+        self.lock_held = lock_held
+        self.read_state = read_state
+        self.spawn = spawn
+        self.kill = kill
+        self.prober = prober
+        self.now_ms = now_ms
+        self.sleep = sleep
+        self.wait_s = wait_s
+
+    def _fresh(self, st):
+        if not st or st.get("last_loop_at") is None:
+            return False
+        return (self.now_ms() - int(st["last_loop_at"])) <= HUNG_THRESHOLD_MS
+
+    def ensure(self):
+        import signal as _signal
+        if self.lock_held():
+            st = self.read_state()
+            if self._fresh(st):
+                return "running"
+            # 挂死:精确身份匹配才杀
+            pid = st.get("daemon_pid") if st else None
+            pstart = st.get("daemon_proc_start") if st else None
+            if not pid or not pstart:
+                return "failed"
+            if procs.probe_alive(self.prober, int(pid), pstart) != procs.ALIVE:
+                return "failed"  # pid 复用/探测不确定:绝不杀
+            try:
+                self.kill(int(pid), _signal.SIGTERM)
+            except OSError:
+                return "failed"
+            for _ in range(int(self.wait_s / _POLL_STEP_S) + 1):
+                if not self.lock_held():
+                    break
+                self.sleep(_POLL_STEP_S)
+            else:
+                return "failed"
+            return "recovered" if self._spawn_and_wait() == "started" else "failed"
+        return self._spawn_and_wait()
+
+    def _spawn_and_wait(self):
+        spawn_at = self.now_ms()
+        self.spawn()
+        for _ in range(int(self.wait_s / _POLL_STEP_S) + 1):
+            self.sleep(_POLL_STEP_S)
+            if self.lock_held():
+                st = self.read_state()
+                # 新拉起必须以"晚于本次 spawn 的心跳"为 ready(旧残留心跳不算)
+                if st and st.get("last_loop_at") is not None \
+                        and int(st["last_loop_at"]) >= spawn_at:
+                    return "started"
+        return "failed"
+
+
+def _read_daemon_state():
+    try:
+        conn = db.connect(paths.db_path(), busy_timeout_ms=2000)
+        try:
+            return {
+                "last_loop_at": db.get_state(conn, "last_loop_at"),
+                "daemon_pid": db.get_state(conn, "daemon_pid"),
+                "daemon_proc_start": db.get_state(conn, "daemon_proc_start"),
+            }
+        finally:
+            conn.close()
+    except Exception:
+        return None
+
+
+def _spawn_daemon():
     daemon_py = paths.skill_root() / "bin" / "daemon.py"
     logf = open(paths.daemon_log_path(), "a")
-    subprocess.Popen([sys.executable, str(daemon_py)],
-                     stdin=subprocess.DEVNULL, stdout=logf, stderr=logf,
-                     start_new_session=True)
-    logf.close()
-    deadline = time.time() + wait_s
-    while time.time() < deadline:
-        if daemon_lock_held():
-            # 等 daemon_state 心跳可读
+    try:
+        subprocess.Popen([sys.executable, str(daemon_py)],
+                         stdin=subprocess.DEVNULL, stdout=logf, stderr=logf,
+                         start_new_session=True)
+    finally:
+        logf.close()
+
+
+def ensure_daemon(wait_s=12, spawn=True):
+    if not spawn:
+        try:
+            conn = db.connect(paths.db_path(), busy_timeout_ms=2000)
             try:
-                conn = db.connect(paths.db_path(), busy_timeout_ms=2000)
-                last = db.get_state(conn, "last_loop_at")
+                return "running" if daemon_healthy(conn) else "down"
+            finally:
                 conn.close()
-                if last is not None:
-                    return "started"
-            except Exception:
-                pass
-        time.sleep(0.3)
-    return "failed"
+        except Exception:
+            return "down"
+    sup = DaemonSupervisor(
+        lock_held=daemon_lock_held, read_state=_read_daemon_state,
+        spawn=_spawn_daemon, kill=os.kill, prober=procs.SystemProber(),
+        now_ms=lambda: int(time.time() * 1000), sleep=time.sleep, wait_s=wait_s)
+    return sup.ensure()
 
 
 # ---------------------------------------------------------------- doctor(显式诊断例外,I2)
-def doctor(runner, chat_id, clock):
-    """真发送+撤回自检;独立 opt-in 工具,不在运行时路径。外发 message_id 落返回值。"""
+def doctor(runner, chat_id, clock, cfg=None):
+    """真发送+撤回自检;独立 opt-in 工具,不在运行时路径。外发 message_id 落返回值。
+    修复项1:自检通过 = 当前 CLI 版本契约已验证 → 若与 config.cli_version 不符,重钉版本
+    (写盘;daemon 的 FingerprintGate 重探读盘后自动放行)。"""
     key = f"doctor:{util.new_id()}"
     res = runner.run(["im", "+messages-send", "--as", "bot", "--chat-id", chat_id,
                       "--text", f"feishu-bridge doctor 自检 {clock.wall_ms()}(即将撤回)",
@@ -280,4 +394,13 @@ def doctor(runner, chat_id, clock):
                     timeout_s=30)
     rc_env = runner_mod.parse_envelope(rc.stdout)
     recalled = runner_mod.envelope_ok(rc_env)
-    return {"ok": recalled, "step": "recall", "message_id": mid, "recalled": recalled}
+    out = {"ok": recalled, "step": "recall", "message_id": mid, "recalled": recalled}
+    if recalled and cfg:
+        from . import fingerprint as fp
+        actual = fp.probe_cli_version(runner)
+        if actual and actual != cfg.get("cli_version"):
+            new_cfg = dict(cfg)
+            new_cfg["cli_version"] = actual
+            configmod.save_config(new_cfg)
+            out["repinned_cli_version"] = actual
+    return out

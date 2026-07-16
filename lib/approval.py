@@ -1,6 +1,8 @@
 """审批回调(plan 4.3):执行门=纯机械(operator 比对 + 单事务 CAS),零模型判断。
-有效回调 = 单事务:INSERT callback_events ∧ 机械校验 ∧ CAS ∧ 入队/物化 ∧ 通知;
-任何一步失败整体回滚(重放可再处理)。无效/重复:仅裸 INSERT OR IGNORE。"""
+有效回调 = 单事务:INSERT callback_events ∧ 机械校验(**在 BEGIN IMMEDIATE 事务内重读
+pending/inbox/card 状态**,修复项6)∧ CAS ∧ 入队/物化 ∧ 通知;任何一步失败整体回滚
+(重放可再处理)。无效/重复:仅裸 INSERT OR IGNORE。
+fail-closed:envelope 缺 chat_id、或卡片已回填后缺/不匹配 message_id → 一律 REJECT。"""
 import hmac
 import json
 import sqlite3
@@ -9,6 +11,10 @@ from . import constants, db, jobs, texts
 
 
 class _Dup(Exception):
+    pass
+
+
+class _Invalid(Exception):
     pass
 
 
@@ -45,14 +51,9 @@ class Approval:
                 av = json.loads(av)
             except ValueError:
                 av = None
-        valid, ctx = self._validate(ev, av)
-        if not valid:
-            self._record_bare(event_id)
-            return "invalid"
-        pending, inbox_row, act = ctx
         now = self.clock.wall_ms()
-        outcome = "approved" if act == "approve" else "rejected"
         media_followup = False
+        inbox_message_id = None
         try:
             with db.tx(self.conn):
                 try:
@@ -61,6 +62,15 @@ class Approval:
                         (event_id, now))
                 except sqlite3.IntegrityError:
                     raise _Dup()
+                if seam:
+                    seam("in_tx_before_validate")
+                # 机械校验:事务内重读(修复项6;此前在事务外读=可被并发回填绕过)
+                valid, ctx = self._validate_in_tx(ev, av)
+                if not valid:
+                    raise _Invalid()
+                pending, inbox_row, act = ctx
+                inbox_message_id = inbox_row["message_id"]
+                outcome = "approved" if act == "approve" else "rejected"
                 ok = db.cas(
                     self.conn,
                     "UPDATE pendings SET state=?, decided_by=?, decided_event_id=?, decided_at=? "
@@ -111,13 +121,15 @@ class Approval:
                     seam("before_commit")
         except _Dup:
             return "dup"
+        except _Invalid:
+            self._record_bare(event_id)
+            return "invalid"
         except _AbortLate:
             self._record_bare(event_id)
             return "late"
         if media_followup:
             row = self.conn.execute(
-                "SELECT * FROM inbox WHERE message_id=?",
-                (inbox_row["message_id"],)).fetchone()
+                "SELECT * FROM inbox WHERE message_id=?", (inbox_message_id,)).fetchone()
             self.inbound.drive_row(row)  # 立即物化尝试(网络在事务外;失败由恢复工人接手)
         return "applied"
 
@@ -126,8 +138,9 @@ class Approval:
             "INSERT OR IGNORE INTO callback_events(event_id,seen_at) VALUES(?,?)",
             (event_id, self.clock.wall_ms()))
 
-    def _validate(self, ev, av):
-        """机械校验(reads 在事务外;真正防线=事务内 CAS)。"""
+    def _validate_in_tx(self, ev, av):
+        """机械校验;调用方保证已在写事务内(读到的就是被 CAS 保护的同一视图)。
+        fail-closed:缺字段一律拒(不再"缺字段跳过校验")。"""
         if not isinstance(av, dict):
             return False, None
         act = av.get("act")
@@ -153,10 +166,10 @@ class Approval:
             "SELECT * FROM inbox WHERE message_id=?", (pending["message_id"],)).fetchone()
         if inbox_row is None:
             return False, None
-        if ev.get("chat_id") and ev["chat_id"] != inbox_row["chat_id"]:
-            return False, None
-        # card_message_id 仅在已回填时校验(回填前点击自愈,4.3)
-        if pending["card_message_id"] and ev.get("message_id") \
-                and ev["message_id"] != pending["card_message_id"]:
-            return False, None
+        if not ev.get("chat_id") or ev["chat_id"] != inbox_row["chat_id"]:
+            return False, None  # 缺 chat_id 也拒(fail-closed)
+        # 卡片已回填 → 回调必须携带且匹配 card_message_id;回填前点击自愈(4.3)
+        if pending["card_message_id"]:
+            if not ev.get("message_id") or ev["message_id"] != pending["card_message_id"]:
+                return False, None
         return True, (pending, inbox_row, act)

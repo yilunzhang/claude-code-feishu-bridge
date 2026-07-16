@@ -220,3 +220,40 @@ class TestMediaApprove:
         assert env.approval.process_event(cb(p)) == "applied"
         assert env.inbox_row("om_img")["state"] == "approved_materializing"
         assert env.deliveries() == []
+
+
+class TestFailClosedValidation:
+    """修复项6:机械校验在 BEGIN IMMEDIATE 事务内;缺字段一律 REJECT。"""
+
+    def test_missing_chat_id_invalid(self, env):
+        p = member_pending(env)
+        ev = cb(p, event_id="cb_nochat")
+        del ev["chat_id"]
+        assert env.approval.process_event(ev) == "invalid"
+        assert pending_row(env, p["pending_id"])["state"] == "pending"
+
+    def test_backfilled_card_missing_message_id_invalid(self, env):
+        p = member_pending(env)
+        env.conn.execute("UPDATE pendings SET card_message_id='om_card_real' "
+                         "WHERE pending_id=?", (p["pending_id"],))
+        ev = cb(p, event_id="cb_nomid")
+        del ev["message_id"]
+        assert env.approval.process_event(ev) == "invalid"
+        assert pending_row(env, p["pending_id"])["state"] == "pending"
+
+    def test_validation_reads_in_tx_state(self, env):
+        """事务内校验:seam 在事务内回填 card_message_id → 携带旧 message_id 的回调必须被拒。"""
+        p = member_pending(env)
+
+        def seam(name):
+            if name == "in_tx_before_validate":
+                env.conn.execute(
+                    "UPDATE pendings SET card_message_id='om_card_fresh' "
+                    "WHERE pending_id=?", (p["pending_id"],))
+
+        r = env.approval.process_event(cb(p, message_id="om_stale"), seam=seam)
+        assert r == "invalid"
+        assert pending_row(env, p["pending_id"])["state"] == "pending"
+        # 携带事务内可见的正确 card id → 通过
+        assert env.approval.process_event(
+            cb(p, event_id="cb_2", message_id="om_card_fresh"), seam=seam) == "applied"

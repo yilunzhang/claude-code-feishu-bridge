@@ -75,9 +75,29 @@ INBOX_NONTERMINAL_STATES = (
     "approved_materializing",
 )
 
-# close_reason → inbound_notice 终态映射(§3/4.2.4/4.8;r7-①:bind_timeout→unbound)
-UNBOUND_CLOSE_REASONS = ("user_unbind", "bind_failed", "bind_timeout")
+# close_reason → inbound_notice 终态映射(§3/4.2.4/4.8;r7-①:bind_timeout→unbound;
+# bind_superseded=同实例 rebind 自愈关闭旧 starting,归"未绑定"类)
+UNBOUND_CLOSE_REASONS = ("user_unbind", "bind_failed", "bind_timeout", "bind_superseded")
 SESSION_CLOSED_REASONS = ("cc_gone", "session_end", "listener_gone", "listener_never_ready")
+
+# 出站错误分类表(修复项4;集合可维护:权限/成员关系/能力/目标不存在=永久→failed,
+# 频控/令牌自刷类=瞬态→unknown(同 key 自动重试仍≤1 次);未知 code→unknown 留人工)
+PERMANENT_SEND_CODES = frozenset({
+    230002,    # bot/user 不在群(成员关系)
+    230013,    # bot 能力未启用
+    99991672,  # app 缺权限 scope
+    230099,    # 回复目标消息不存在/已撤回
+})
+TRANSIENT_SEND_CODES = frozenset({
+    230020,    # 请求频控
+    99991661,  # tenant access token 失效(CLI 自刷新)
+    99991663,  # app access token 失效(CLI 自刷新)
+})
+
+# approval_card 重臂(修复项3):failed → pending 退避重臂,总尝试上限
+CARD_REARM_MAX_ATTEMPTS = 5
+CARD_REARM_BACKOFF_MS = 30_000
+CARD_REARM_BACKOFF_MAX_MS = 10 * 60 * 1000
 
 SUPPORTED_MSG_TYPES = ("text", "image", "file", "post")
 MEDIA_MSG_TYPES = ("image", "file")

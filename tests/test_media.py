@@ -102,3 +102,22 @@ def test_path_traversal_names_sanitized(env):
     assert paths is not None
     for p in paths:
         assert pathlib.Path(p).parent == env.media_root / BID / "om_m2"  # 拍平,无穿越
+
+
+def test_dot_segment_ids_rejected(env):
+    for bad in (".", "..", ".hidden"):
+        with pytest.raises(MediaError):
+            media.materialize(env.runner, env.media_root, bad, "om_x")
+        with pytest.raises(MediaError):
+            media.materialize(env.runner, env.media_root, "bind-ok", bad)
+    assert env.runner.calls == []  # 拒绝发生在任何下载之前
+
+
+def test_realpath_escape_via_symlinked_binding_dir(env, tmp_path):
+    outside = tmp_path / "outside-victim"
+    outside.mkdir()
+    (env.media_root).mkdir(parents=True, exist_ok=True)
+    os.symlink(outside, env.media_root / "bind-link")
+    with pytest.raises(MediaError):
+        media.materialize(env.runner, env.media_root, "bind-link", "om_x")
+    assert env.runner.calls == []
