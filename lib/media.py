@@ -1,0 +1,75 @@
+"""media 物化:每 message 独立临时目录 → 校验(防符号链接/穿越/配额)→ 原子 rename(§3)。
+返回:成功=绝对路径列表;瞬态失败=None(恢复工人按 deadline 重试);确定性失败=raise MediaError。"""
+import os
+import pathlib
+import shutil
+import uuid
+
+from . import constants, runner as runner_mod
+
+
+class MediaError(Exception):
+    """确定性物化失败(符号链接/配额/文件系统错误/空结果)→ fail-closed。"""
+
+
+def _existing(dest):
+    return sorted(str(p) for p in dest.iterdir() if p.is_file() and not p.is_symlink())
+
+
+def materialize(runner, media_root, binding_id, message_id,
+                quota_bytes=None, timeout_s=constants.DOWNLOAD_TIMEOUT_S):
+    if quota_bytes is None:
+        quota_bytes = constants.MEDIA_MSG_QUOTA_BYTES
+    media_root = pathlib.Path(media_root)
+    # 防穿越:id 只作单层目录名
+    if os.sep in str(binding_id) or os.sep in str(message_id):
+        raise MediaError("bad id")
+    dest = media_root / str(binding_id) / str(message_id)
+    if dest.is_dir():
+        return _existing(dest)  # 幂等复用(此前成功过)
+    tmp = None
+    try:
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        tmp = dest.parent / f".tmp-{message_id}-{uuid.uuid4().hex[:8]}"
+        tmp.mkdir()
+        res = runner.run(
+            ["im", "+messages-mget", "--as", "bot", "--message-ids", str(message_id),
+             "--no-reactions", "--download-resources"],
+            timeout_s=timeout_s, cwd=str(tmp))
+        env = runner_mod.parse_envelope(res.stdout)
+        if res.rc != 0 or not runner_mod.envelope_ok(env):
+            return None  # 瞬态:网络/信封失败 → 稍后重试
+        # 收集(先全量校验再搬运)
+        found = []
+        total = 0
+        for root, dirs, files in os.walk(tmp, followlinks=False):
+            for name in files:
+                src = pathlib.Path(root) / name
+                if src.is_symlink():
+                    raise MediaError("symlink in download tree")
+                if not src.is_file():
+                    continue
+                total += src.stat().st_size
+                if total > quota_bytes:
+                    raise MediaError(f"media quota exceeded ({total} > {quota_bytes})")
+                found.append(src)
+        if not found:
+            raise MediaError("no resource files downloaded")
+        staging = tmp / "_staged"
+        staging.mkdir()
+        seen = set()
+        for i, src in enumerate(found):
+            base = os.path.basename(src.name) or f"file{i}"
+            if base in seen:
+                base = f"{i}-{base}"
+            seen.add(base)
+            os.replace(src, staging / base)  # 同卷内移动
+        os.rename(staging, dest)  # 原子露出
+        return _existing(dest)
+    except MediaError:
+        raise
+    except OSError as e:
+        raise MediaError(f"fs error: {e}") from e
+    finally:
+        if tmp is not None:
+            shutil.rmtree(tmp, ignore_errors=True)
