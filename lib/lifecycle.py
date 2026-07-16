@@ -101,13 +101,11 @@ def _terminate_in_tx(conn, binding_id, close_reason, now, new_status="closed",
         "UPDATE outbound_jobs SET state='cancelled' WHERE binding_id=? "
         "AND state IN ('pending','unknown')", (binding_id,))
 
-    # pending_bind 终态化并关闩(SessionEnd/超时/强关)
+    # pending_bind 终态化并关闩(仅本次终态化的行;已终态行的闩不动——
+    # 4.1.6 nonce-miss 路径要求 latch 仍置,链闩由下一个 fresh Stop 自愈,SessionEnd 另行显式关)
     conn.execute(
         "UPDATE pending_bind SET state='expired', latch_open=0 "
         "WHERE request_id=? AND state='pending'", (binding_id,))
-    conn.execute(
-        "UPDATE pending_bind SET latch_open=0 WHERE request_id=? AND latch_open=1",
-        (binding_id,))
 
     if notify:
         jobs.create_job(
