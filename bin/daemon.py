@@ -1,0 +1,120 @@
+#!/usr/bin/env python3
+"""bridge daemon:flock 单例;真实依赖装配;单线程事件循环(I2:唯一发送进程)。"""
+import fcntl
+import os
+import pathlib
+import signal
+import sys
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
+
+from lib import config as configmod  # noqa: E402
+from lib import constants, db, paths, procs, util  # noqa: E402
+from lib.approval import Approval  # noqa: E402
+from lib.clock import SystemClock  # noqa: E402
+from lib.daemon_core import ConsumerManager, DaemonCore  # noqa: E402
+from lib.inbound import Inbound  # noqa: E402
+from lib.outbound import Outbound  # noqa: E402
+from lib.recovery import Recovery  # noqa: E402
+from lib.runner import LarkRunner, parse_envelope  # noqa: E402
+
+
+def log_line(msg):
+    import datetime
+    ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        util.append_log_line(paths.daemon_log_path(), f"{ts} {msg}")
+    except OSError:
+        pass
+
+
+def verify_fingerprint(runner, cfg):
+    """profile/app_id 指纹钉死启动校验(§5)。确证不符 → mismatch;探测失败 → unknown。"""
+    res = runner.run(["auth", "status"], timeout_s=20)
+    env = parse_envelope(res.stdout)
+    if res.rc != 0 or not isinstance(env, dict):
+        return "unknown"
+    app_id = env.get("appId")
+    owner = ((env.get("identities") or {}).get("user") or {}).get("openId")
+    if app_id and app_id != cfg["app_id"]:
+        return "mismatch"
+    if owner and owner != cfg["owner_open_id"]:
+        return "mismatch"
+    return "ok"
+
+
+def main():
+    paths.ensure_data_dir()
+    # flock 单例(F7):锁被持有 → 已有 daemon → 静默退出
+    lock_fd = os.open(str(paths.lock_path()), os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        return 0
+    try:
+        cfg = configmod.require_config()
+    except configmod.ConfigError as e:
+        log_line(f"refuse start: {e}")
+        return 2
+    clock = SystemClock()
+    conn = db.connect(paths.db_path(), busy_timeout_ms=constants.BUSY_TIMEOUT_DAEMON_MS)
+    db.init_schema(conn, paths.schema_path())
+    runner = LarkRunner(cfg["profile"])
+    fp = verify_fingerprint(runner, cfg)
+    if fp == "mismatch":
+        log_line("refuse start: identity fingerprint mismatch (profile/app_id/owner)")
+        db.set_state(conn, "last_error", "fingerprint mismatch — daemon refused to start")
+        return 3
+    if fp == "unknown":
+        log_line("warn: identity probe failed at startup; continuing (consumers will retry)")
+
+    prober = procs.SystemProber()
+    inbound = Inbound(conn, cfg, runner, clock, paths.media_root())
+    outbound = Outbound(conn, cfg, runner, clock)
+    approval = Approval(conn, cfg, clock, inbound=inbound)
+    recovery = Recovery(conn, cfg, runner, clock, inbound, prober)
+    core = DaemonCore(conn, cfg, clock, inbound, approval, outbound, recovery, log=log_line)
+
+    def on_status(key, status, detail):
+        log_line(f"consumer[{key}] {status}: {detail}")
+        db.set_state(conn, f"consumer_{key}_{'ready' if status == 'ready' else 'last_status'}",
+                     f"{status} {detail}"[:200])
+        if status in ("exited", "rapid-exit-alert", "spawn-failed"):
+            db.bump_counter(conn, f"consumer_{key}_restarts")
+
+    mgr = ConsumerManager(cfg["profile"], clock,
+                          on_line=core.route_line, on_status=on_status)
+
+    stop = {"flag": False}
+
+    def on_signal(signum, frame):
+        stop["flag"] = True
+
+    signal.signal(signal.SIGTERM, on_signal)
+    signal.signal(signal.SIGINT, on_signal)
+
+    db.set_state(conn, "daemon_pid", os.getpid())
+    db.set_state(conn, "daemon_started_at", clock.wall_ms())
+    outbound.startup_scan()
+    recovery.slow_tick()
+    mgr.start_all()
+    log_line(f"daemon started pid={os.getpid()} profile={cfg['profile']}")
+    try:
+        while not stop["flag"]:
+            mgr.poll(1.0)
+            core.loop_iteration()
+            mgr.tick()
+    finally:
+        log_line("daemon shutting down")
+        mgr.shutdown()
+        try:
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        except Exception:
+            pass
+        conn.close()
+        os.close(lock_fd)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
