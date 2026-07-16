@@ -1,0 +1,135 @@
+"""Test fakes: clock, lark-cli runner, process prober. 不 mock 被测逻辑本身。"""
+import json
+
+
+class FakeClock:
+    """wall/mono 独立可拨,支持时钟回拨测试。单位 ms。"""
+
+    def __init__(self, wall=1_000_000_000_000, mono=50_000):
+        self.wall = wall
+        self.mono = mono
+
+    def wall_ms(self):
+        return self.wall
+
+    def mono_ms(self):
+        return self.mono
+
+    def tick(self, ms):
+        """正常流逝:两钟同进。"""
+        self.wall += ms
+        self.mono += ms
+
+    def rewind_wall(self, ms):
+        """墙钟回拨(单调钟继续走)。"""
+        self.wall -= ms
+
+
+class FakeRunResult:
+    def __init__(self, rc=0, stdout="", stderr="", timed_out=False, exc=None):
+        self.rc = rc
+        self.stdout = stdout
+        self.stderr = stderr
+        self.timed_out = timed_out
+        self.exc = exc
+
+
+def ok_envelope(data, notice=None):
+    env = {"ok": True, "data": data}
+    if notice:
+        env["_notice"] = notice
+    return FakeRunResult(0, json.dumps(env))
+
+
+def err_envelope(code, msg="err"):
+    return FakeRunResult(1, json.dumps({"ok": False, "code": code, "msg": msg}))
+
+
+class FakeRunner:
+    """可注入 lark-cli runner。responders: list of (predicate(args)->bool, fn(args, cwd)->FakeRunResult)。
+    未匹配调用默认抛 AssertionError(离线铁律:绝不静默放过未预期的外呼)。"""
+
+    def __init__(self, profile="main"):
+        self.profile = profile
+        self.calls = []  # [(args, cwd)]
+        self.responders = []
+        self.default = None  # 若设置,未匹配时返回
+
+    def on(self, predicate, fn):
+        self.responders.append((predicate, fn))
+        return self
+
+    def on_prefix(self, prefix, fn):
+        prefix = list(prefix)
+
+        def pred(args):
+            return list(args[: len(prefix)]) == prefix
+
+        return self.on(pred, fn)
+
+    def run(self, args, timeout_s=None, cwd=None):
+        args = list(args)
+        self.calls.append((args, cwd))
+        for pred, fn in self.responders:
+            if pred(args):
+                res = fn(args, cwd) if callable(fn) else fn
+                return res
+        if self.default is not None:
+            return self.default(args, cwd) if callable(self.default) else self.default
+        raise AssertionError(f"unexpected lark-cli call in offline test: {args}")
+
+    def calls_matching(self, *prefix):
+        prefix = list(prefix)
+        return [c for c in self.calls if c[0][: len(prefix)] == prefix]
+
+
+class FakeProber:
+    """pid → (ppid, lstart, comm);缺席=进程不存在;raising=探测异常(UNKNOWN)。"""
+
+    def __init__(self):
+        self.table = {}
+        self.raising = False
+
+    def set(self, pid, ppid, lstart, comm):
+        self.table[pid] = (ppid, lstart, comm)
+
+    def remove(self, pid):
+        self.table.pop(pid, None)
+
+    def get(self, pid):
+        if self.raising:
+            raise RuntimeError("simulated ps failure")
+        return self.table.get(pid)
+
+
+def mget_snapshot(message_id, chat_id, sender_id, msg_type="text", text="hi",
+                  mentions=(), sender_type="user", extra_content=None):
+    """构造 +messages-mget 的 .data.messages[] 单条(按 brief/S1 实测形状)。"""
+    if msg_type == "text":
+        content = {"text": text}
+    elif msg_type == "image":
+        content = {"image_key": "img_k1"}
+    elif msg_type == "file":
+        content = {"file_key": "file_k1", "file_name": "a.pdf"}
+    elif msg_type == "post":
+        content = {"title": "t", "content": [[{"tag": "text", "text": text}]]}
+    else:
+        content = {}
+    if extra_content:
+        content.update(extra_content)
+    return {
+        "message_id": message_id,
+        "chat_id": chat_id,
+        "msg_type": msg_type,
+        "sender": {"id": sender_id, "id_type": "open_id", "sender_type": sender_type},
+        "body": {"content": json.dumps(content, ensure_ascii=False)},
+        "mentions": list(mentions),
+    }
+
+
+def bot_mention(app_id, key="@_user_1", name="TestBot"):
+    return {"key": key, "id": app_id, "id_type": "app_id", "name": name}
+
+
+def user_mention(open_id, key="@_user_2", name="Some One"):
+    return {"key": key, "id": open_id, "id_type": "open_id", "name": name}
