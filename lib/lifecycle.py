@@ -115,11 +115,18 @@ def _terminate_in_tx(conn, binding_id, close_reason, now, new_status="closed",
         "UPDATE outbound_jobs SET state='cancelled' WHERE binding_id=? "
         "AND state IN ('pending','unknown')", (binding_id,))
 
-    # pending_bind 终态化并关闩(仅本次终态化的行;已终态行的闩不动——
+    # pending_bind 终态化并关闩(仅本次终态化的行;已终态行的闩通常不动——
     # 4.1.6 nonce-miss 路径要求 latch 仍置,链闩由下一个 fresh Stop 自愈,SessionEnd 另行显式关)
     conn.execute(
         "UPDATE pending_bind SET state='expired', latch_open=0 "
         "WHERE request_id=? AND state='pending'", (binding_id,))
+    if close_reason == "bind_superseded":
+        # r2-m1:supersede 场景把同实例 consumed 且 latch_open=1 的 tombstone 一并关闩,
+        # 否则新 bind 的 continuation Stop 会被旧闩误抑制而错过握手(nonce-miss 留闩语义不变)
+        conn.execute(
+            "UPDATE pending_bind SET latch_open=0 "
+            "WHERE cc_pid=? AND cc_start=? AND latch_open=1",
+            (row["cc_pid"], row["cc_start"]))
 
     if notify:
         jobs.create_job(

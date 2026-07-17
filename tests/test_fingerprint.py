@@ -168,3 +168,86 @@ class TestDoctorRepin:
         from lib import ctl
         res = ctl.doctor(env.runner, CHAT, env.clock, cfg=env.cfg)
         assert res["ok"] and "repinned_cli_version" not in res
+
+
+class TestReverify:
+    """r2-M2:ok 后也周期复检;漂移 → 下一循环发送前关门。"""
+
+    def _ok_gate(self, env, mutable):
+        r = FakeRunner(profile=PROFILE)
+
+        def auth(a, c):
+            return auth_resp(app_id=mutable["app_id"])
+
+        r.on_prefix(["auth", "status"], auth)
+        r.on(lambda a: a[:1] == ["--version"], lambda a, c: FakeRunResult(0, "1.0.66\n"))
+        gate = fingerprint.FingerprintGate(env.conn, env.cfg, r, env.clock)
+        assert gate.startup() == "ok"
+        return gate, r
+
+    def test_ok_state_no_probe_before_interval(self, env):
+        mutable = {"app_id": "cli_testapp"}
+        gate, r = self._ok_gate(env, mutable)
+        n = len(r.calls_matching("auth", "status"))
+        gate.tick()
+        assert len(r.calls_matching("auth", "status")) == n  # 10min 内不复检
+
+    def test_ok_reverifies_and_closes_on_drift(self, env):
+        mutable = {"app_id": "cli_testapp"}
+        gate, r = self._ok_gate(env, mutable)
+        mutable["app_id"] = "cli_evil"  # 身份漂移
+        env.clock.tick(fingerprint.REVERIFY_INTERVAL_MS + 1)
+        gate.tick()
+        g = dbmod.get_state(env.conn, "outbound_gate")
+        assert g.startswith("degraded")
+
+    def test_loop_closes_gate_before_send_on_drift(self, env):
+        """DaemonCore 循环序:gate.tick 先于 outbound.tick → 漂移后零发送。"""
+        from lib.daemon_core import DaemonCore
+        mutable = {"app_id": "cli_testapp"}
+        gate, r = self._ok_gate(env, mutable)
+        core = DaemonCore(env.conn, env.cfg, env.clock, env.inbound, env.approval,
+                          env.outbound, env.recovery, gate=gate)
+        bid = env.make_binding(status="active")
+        jobs.create_job(env.conn, kind="session_turn", chat_id=CHAT, binding_id=bid,
+                        idempotency_key="turn:g:0", turn_group="g", chunk_index=0,
+                        body="秘密", now=env.clock.wall_ms())
+        mutable["app_id"] = "cli_evil"
+        env.clock.tick(fingerprint.REVERIFY_INTERVAL_MS + 1)
+        core.loop_iteration()
+        row = env.conn.execute(
+            "SELECT state FROM outbound_jobs WHERE idempotency_key='turn:g:0'").fetchone()
+        assert row[0] == "pending"  # 未发送(门先关)
+        assert env.runner.calls_matching("im", "+messages-send") == []
+
+
+class TestVersionProbeArgv:
+    """E1(真机实锤):`--version` 不吃全局 --profile;拖尾会 rc=2。"""
+
+    def test_build_argv_no_profile(self):
+        from lib.runner import LarkRunner
+        r = LarkRunner("main")
+        assert r.build_argv(["--version"], no_profile=True) == ["lark-cli", "--version"]
+        assert r.build_argv(["im", "+chat-list", "--as", "bot"]) == \
+               ["lark-cli", "im", "+chat-list", "--as", "bot", "--profile", "main"]
+
+    def test_probe_version_true_shape(self, cfg):
+        """fake 对 --version+--profile 组合返回 rc=2,逼实现走裸 --version。"""
+        r = FakeRunner(profile=PROFILE)
+        r.on(lambda a: "--version" in a and "--profile" in a,
+             lambda a, c: FakeRunResult(2, "", "unknown command"))
+        r.on(lambda a: a == ["--version"], lambda a, c: FakeRunResult(0, "1.0.66\n"))
+        assert fingerprint.probe_cli_version(r) == "1.0.66"
+
+    def test_bootstrap_version_probe_true_shape(self, data_dir):
+        from tests.test_bridgectl import auth_status_runner
+        from lib.clock import SystemClock
+        from lib import ctl
+        r = auth_status_runner()
+        # 移除宽松 version responder,换成真形状
+        r.responders = [x for x in r.responders if not x[0](["--version"])]
+        r.on(lambda a: "--version" in a and "--profile" in a,
+             lambda a, c: FakeRunResult(2, "", "unknown command"))
+        r.on(lambda a: a == ["--version"], lambda a, c: FakeRunResult(0, "1.0.66\n"))
+        cfg = ctl.bootstrap(r, PROFILE, SystemClock())
+        assert cfg["cli_version"] == "1.0.66"

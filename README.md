@@ -65,8 +65,13 @@
 3. 指纹初始化(首次;profile 一经选定钉死):
 
    ```bash
-   python3 ~/.claude/skills/feishu-bridge/bin/bridgectl.py bootstrap --profile <lark-cli profile 名>
+   python3 ~/.claude/skills/feishu-bridge/bin/bridgectl.py bootstrap --profile <lark-cli profile 名> \
+     [--chat-allowlist oc_xxx,oc_yyy]
    ```
+
+   `--chat-allowlist`(可选):逗号分隔的 chat_id 白名单,用于**灰度/测试隔离**——daemon 对
+   非列内群的事件在任何入库/回复之前直接丢弃(零副作用零痕迹)。缺省/空 = 不限制(plan 语义)。
+   改动 allowlist 需编辑 `config.json` 后重启 daemon 生效;`status` 会显示当前值。
 
 ## 用法
 
@@ -131,7 +136,7 @@ cd ~/.claude/skills/feishu-bridge && python3 -m pytest tests/ -q
 ## 故障排查
 
 1. `python3 $B status`:daemon `last_loop_age_s` 应 <5s;consumer 应 ready;看 `outbound_jobs.unknown/failed` 与 `counters`。
-2. daemon 不动 → `tail -50 ~/.claude/data/feishu-bridge/daemon.log`;手动 `python3 $B ensure-daemon`(锁被持有但心跳陈旧 >60s = 挂死,会按记录的 pid+启动时间精确匹配后 SIGTERM 并接管重启;listener 的探活同样以"锁+心跳新鲜"为准,会自动触发该自愈)。`status.outbound_gate` 非 `ok` = 出站停摆(身份未验证/版本不符),看 `gate_hint`。
+2. daemon 不动 → `tail -50 ~/.claude/data/feishu-bridge/daemon.log`;手动 `python3 $B ensure-daemon`(锁被持有但心跳陈旧 **>300s** = 挂死——阈值远大于单次合法下载 120s,且含网络的条目处理完都会多点刷新心跳;判定挂死后按记录的 pid+启动时间精确匹配 SIGTERM 并接管重启,全程持 singleflight 锁防两个 ensure 重叠;listener 的探活同样以"锁+心跳新鲜"为准,自动触发该自愈)。`status.outbound_gate` 非 `ok` = 出站停摆(身份未验证/版本不符),看 `gate_hint`;门在 ok 状态也每 10 分钟复检一次,身份/版本漂移会在下一循环发送前自动关门。
 3. 转发缺失 → `hook_drops.log`(hook fail-closed 记录);确认 hooks 已装且 CC 重启过;确认绑定 active(`status`)。
 4. 群消息进不来 → bot 是否在群里、是否真的 @ 了 bot(要结构化 @,转发/引用里的假 @ 无效)、VPN/WS 是否在线(daemon.log 的 consumer 状态)。
 5. 彻底重置:unbind 全部绑定 → 杀 daemon(`pkill -f feishu-bridge/bin/daemon.py`,SIGTERM)→ 删 `~/.claude/data/feishu-bridge/`(会丢历史)→ 重新 bootstrap。

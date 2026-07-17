@@ -36,11 +36,17 @@ def materialize(runner, media_root, binding_id, message_id,
     root_real = os.path.realpath(media_root)
     if not os.path.realpath(dest).startswith(root_real + os.sep):
         raise MediaError("media path escapes media root")
+    # r2-m3:dest/parent 为 symlink(即使指向 root 内)一律拒绝(lstat 语义)
+    if os.path.islink(dest) or os.path.islink(dest.parent):
+        raise MediaError("symlinked media path rejected")
     if dest.is_dir():
         return _existing(dest)  # 幂等复用(此前成功过)
     tmp = None
     try:
         dest.parent.mkdir(parents=True, exist_ok=True)
+        # r2-m3:O_NOFOLLOW 语义 —— mkdir 后 lstat 复验(挡 mkdir 间隙被换成 symlink)
+        if os.path.islink(dest.parent):
+            raise MediaError("symlinked media parent rejected")
         tmp = dest.parent / f".tmp-{message_id}-{uuid.uuid4().hex[:8]}"
         tmp.mkdir()
         res = runner.run(

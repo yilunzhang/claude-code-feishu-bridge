@@ -121,3 +121,26 @@ def test_realpath_escape_via_symlinked_binding_dir(env, tmp_path):
     with pytest.raises(MediaError):
         media.materialize(env.runner, env.media_root, "bind-link", "om_x")
     assert env.runner.calls == []
+
+
+def test_symlinked_dest_inside_root_rejected(env):
+    """r2-m3:dest 已存在但是 symlink(即使指向 root 内)→ 拒绝复用。"""
+    real = env.media_root / "bind-real" / "om_real"
+    real.mkdir(parents=True)
+    (real / "f.bin").write_bytes(b"x")
+    linkdir = env.media_root / "bind-a"
+    linkdir.mkdir(parents=True)
+    os.symlink(real, linkdir / "om_link")
+    with pytest.raises(MediaError):
+        media.materialize(env.runner, env.media_root, "bind-a", "om_link")
+    assert env.runner.calls == []  # 任何下载之前拒绝
+
+
+def test_symlinked_parent_inside_root_rejected(env):
+    """r2-m3:binding 目录本身是 symlink(指向 root 内他处)→ 拒绝(mkdir 后 lstat 校验)。"""
+    other = env.media_root / "bind-b"
+    other.mkdir(parents=True)
+    os.symlink(other, env.media_root / "bind-linked")
+    with pytest.raises(MediaError):
+        media.materialize(env.runner, env.media_root, "bind-linked", "om_x")
+    assert env.runner.calls == []

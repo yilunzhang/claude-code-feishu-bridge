@@ -13,7 +13,7 @@ from . import runner as runner_mod
 
 
 # ---------------------------------------------------------------- bootstrap(S5 身份配方)
-def bootstrap(runner, profile, clock):
+def bootstrap(runner, profile, clock, chat_allowlist=None):
     auth = runner.run(["auth", "status"], timeout_s=30)
     auth_obj = runner_mod.parse_envelope(auth.stdout)
     if auth.rc != 0 or not isinstance(auth_obj, dict):
@@ -40,9 +40,9 @@ def bootstrap(runner, profile, clock):
             break
     if not bot_open_id:
         raise configmod.ConfigError("bot/v3/info 未取到 .bot.open_id(--format ndjson)")
-    ver = runner.run(["--version"], timeout_s=10)
-    cli_version = (ver.stdout or "").strip().splitlines()[0].strip() if (ver.stdout or "").strip() else None
-    if ver.rc != 0 or not cli_version:
+    from . import fingerprint as fp
+    cli_version = fp.probe_cli_version(runner)  # E1:裸 --version(不拖 --profile)
+    if not cli_version:
         raise configmod.ConfigError("lark-cli --version 探测失败:cli_version 必填(版本门基准)")
     cfg = {
         "profile": profile,
@@ -53,6 +53,8 @@ def bootstrap(runner, profile, clock):
         "cli_version": cli_version,
         "created_at": clock.wall_ms(),
     }
+    if chat_allowlist:
+        cfg["chat_allowlist"] = list(chat_allowlist)  # E2:灰度/测试隔离;缺省/空=全部
     with configmod.bootstrap_lock():
         if configmod.load_config() is not None:
             raise configmod.ConfigError(
@@ -216,6 +218,7 @@ def status_report(conn, cfg, clock):
                         ("profile", "app_id", "bot_open_id", "bot_name", "owner_open_id",
                          "cli_version")},
         "schema_version": db.get_state(conn, "schema_version"),
+        "chat_allowlist": cfg.get("chat_allowlist") or "全部(未限制)",
         "outbound_gate": gate,
         "daemon": daemon,
         "consumers": consumers,
@@ -255,8 +258,34 @@ def daemon_lock_held():
 # 修复项5:daemon 挂死恢复。锁被持有但心跳陈旧(>HUNG_THRESHOLD)= 挂死 →
 # 按记录的 (daemon_pid, daemon_proc_start) 精确匹配后 SIGTERM → 等退出 → 接管重启;
 # 身份不匹配(pid 复用/无记录)绝不杀随机进程 → failed。
-HUNG_THRESHOLD_MS = 60_000
+# r2-M1①:阈值 ≥300s(单次合法下载 120s+mget 30s 量级;配合多点心跳不误杀);
+# r2-M1④:接管全程持 singleflight flock,防两个 ensure 重叠 kill/spawn。
+HUNG_THRESHOLD_MS = 300_000
 _POLL_STEP_S = 0.3
+
+
+class _FlockSingleflight:
+    def __init__(self, path):
+        self.path = str(path)
+        self.fd = None
+
+    def try_acquire(self):
+        self.fd = os.open(self.path, os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return True
+        except OSError:
+            os.close(self.fd)
+            self.fd = None
+            return False
+
+    def release(self):
+        if self.fd is not None:
+            try:
+                fcntl.flock(self.fd, fcntl.LOCK_UN)
+            finally:
+                os.close(self.fd)
+                self.fd = None
 
 
 def daemon_healthy(conn, now_ms=None):
@@ -274,10 +303,11 @@ def daemon_healthy(conn, now_ms=None):
 
 
 class DaemonSupervisor:
-    """依赖全注入的 ensure 逻辑(可测):lock_held()/read_state()/spawn()/kill(pid,sig)。"""
+    """依赖全注入的 ensure 逻辑(可测):lock_held()/read_state()/spawn()/kill(pid,sig);
+    singleflight(可选,对象须有 try_acquire()/release())防重叠接管(r2-M1④)。"""
 
     def __init__(self, *, lock_held, read_state, spawn, kill, prober,
-                 now_ms, sleep, wait_s=12):
+                 now_ms, sleep, wait_s=12, singleflight=None):
         self.lock_held = lock_held
         self.read_state = read_state
         self.spawn = spawn
@@ -286,18 +316,39 @@ class DaemonSupervisor:
         self.now_ms = now_ms
         self.sleep = sleep
         self.wait_s = wait_s
+        self.singleflight = singleflight
 
     def _fresh(self, st):
         if not st or st.get("last_loop_at") is None:
             return False
         return (self.now_ms() - int(st["last_loop_at"])) <= HUNG_THRESHOLD_MS
 
+    def _await_health(self):
+        """并发接管者在干活:本次只等结果,零 kill 零 spawn。"""
+        for _ in range(int(self.wait_s / _POLL_STEP_S) + 1):
+            if self.lock_held() and self._fresh(self.read_state()):
+                return "running"
+            self.sleep(_POLL_STEP_S)
+        return "failed"
+
     def ensure(self):
+        if self.lock_held() and self._fresh(self.read_state()):
+            return "running"  # 快路径,无须 singleflight
+        if self.singleflight is not None:
+            if not self.singleflight.try_acquire():
+                return self._await_health()
+            try:
+                return self._ensure_locked()
+            finally:
+                self.singleflight.release()
+        return self._ensure_locked()
+
+    def _ensure_locked(self):
         import signal as _signal
         if self.lock_held():
             st = self.read_state()
             if self._fresh(st):
-                return "running"
+                return "running"  # 等锁期间对方已恢复
             # 挂死:精确身份匹配才杀
             pid = st.get("daemon_pid") if st else None
             pstart = st.get("daemon_proc_start") if st else None
@@ -371,7 +422,8 @@ def ensure_daemon(wait_s=12, spawn=True):
     sup = DaemonSupervisor(
         lock_held=daemon_lock_held, read_state=_read_daemon_state,
         spawn=_spawn_daemon, kill=os.kill, prober=procs.SystemProber(),
-        now_ms=lambda: int(time.time() * 1000), sleep=time.sleep, wait_s=wait_s)
+        now_ms=lambda: int(time.time() * 1000), sleep=time.sleep, wait_s=wait_s,
+        singleflight=_FlockSingleflight(paths.ensure_lock_path()))
     return sup.ensure()
 
 

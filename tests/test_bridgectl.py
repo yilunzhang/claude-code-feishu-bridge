@@ -130,3 +130,20 @@ class TestDoctor:
         assert res["ok"] and res["message_id"] == "om_doc" and res["recalled"]
         del_call = env.runner.calls_matching("api", "DELETE")[0]
         assert del_call[0][2] == "/open-apis/im/v1/messages/om_doc"
+
+
+class TestChatAllowlistPlumbing:
+    def test_bootstrap_stores_allowlist(self, data_dir):
+        from lib.clock import SystemClock
+        cfg = ctl.bootstrap(auth_status_runner(), PROFILE, SystemClock(),
+                            chat_allowlist=["oc_a", "oc_b"])
+        assert cfg["chat_allowlist"] == ["oc_a", "oc_b"]
+        assert configmod.load_config()["chat_allowlist"] == ["oc_a", "oc_b"]
+
+    def test_status_shows_allowlist(self, env):
+        env.cfg["chat_allowlist"] = ["oc_a"]
+        rep = ctl.status_report(env.conn, env.cfg, env.clock)
+        assert rep["chat_allowlist"] == ["oc_a"]
+        env.cfg.pop("chat_allowlist")
+        rep = ctl.status_report(env.conn, env.cfg, env.clock)
+        assert "全部" in rep["chat_allowlist"]

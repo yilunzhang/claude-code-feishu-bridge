@@ -214,3 +214,29 @@ class TestActiveGate:
         env.inbound.drive_row(env.inbox_row("om_x"))
         assert env.inbox_row("om_x")["state"] == "session_closed"
         assert env.deliveries(bid) == []
+
+
+class TestChatAllowlist:
+    """E2:config.chat_allowlist 灰度门 —— 非列内 chat 在任何 inbox/notice 之前直接丢弃。"""
+
+    def test_out_of_list_zero_trace(self, env):
+        env.cfg["chat_allowlist"] = ["oc_allowed_only"]
+        env.make_binding(status="active")  # CHAT 有活跃绑定也不行
+        env.recv_event(content="@TestBot hi")
+        assert env.inbox_row("om_1") is None  # 零 inbox 行
+        assert env.jobs() == []               # 零 job
+        assert env.runner.calls == []         # 零 API 调用(零副作用零回复)
+
+    def test_in_list_processed_normally(self, env):
+        env.cfg["chat_allowlist"] = [CHAT]
+        env.make_binding(status="active")
+        env.arm_mget([mget_snapshot("om_1", CHAT, OWNER, mentions=[bot_mention(APP_ID)])])
+        env.recv_event()
+        assert env.inbox_row("om_1")["state"] == "enqueued"
+
+    def test_empty_or_absent_means_all(self, env):
+        env.cfg["chat_allowlist"] = []
+        env.make_binding(status="active")
+        env.arm_mget([mget_snapshot("om_1", CHAT, OWNER, mentions=[bot_mention(APP_ID)])])
+        env.recv_event()
+        assert env.inbox_row("om_1") is not None

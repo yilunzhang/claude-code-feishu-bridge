@@ -43,6 +43,10 @@ def bootstrap_lock_path():
     return data_dir() / "bootstrap.lock"
 
 
+def ensure_lock_path():
+    return data_dir() / "ensure.lock"  # ensure-daemon 接管 singleflight(r2-M1④)
+
+
 def daemon_log_path():
     return data_dir() / "daemon.log"
 

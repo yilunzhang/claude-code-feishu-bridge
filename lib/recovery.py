@@ -44,6 +44,7 @@ class Recovery:
         lifecycle.expire_stale_pending_binds(self.conn, self.clock)
         self._close_orphan_starting(now)
         self._reclaim_leases(now)
+        self._sweep_stranded_enqueued(now)
         self._legacy_sending(now)
         self._retention(now)
 
@@ -117,7 +118,10 @@ class Recovery:
                 constants.CARD_REARM_BACKOFF_MAX_MS)
             db.cas(self.conn,
                    "UPDATE outbound_jobs SET state='pending', next_attempt_at=? "
-                   "WHERE job_id=? AND state='failed'", (now + delay, j["job_id"]))
+                   "WHERE job_id=? AND state='failed' "
+                   "AND EXISTS(SELECT 1 FROM bindings b "
+                   "  WHERE b.binding_id=outbound_jobs.binding_id AND b.status='active')",
+                   (now + delay, j["job_id"]))  # r2-M3:绑定复验在同一语句内
 
     def _redrive_materializing(self, now):
         rows = self.conn.execute(
@@ -190,18 +194,26 @@ class Recovery:
             lifecycle.terminate_binding(self.conn, r["binding_id"], "bind_timeout", self.clock)
 
     def _reclaim_leases(self, now):
-        rows = self.conn.execute(
-            "SELECT d.*, b.status AS b_status FROM deliveries d "
-            "JOIN bindings b ON b.binding_id=d.binding_id "
-            "WHERE d.state='leased' AND d.lease_until IS NOT NULL AND d.lease_until<?",
-            (now,)).fetchall()
-        for d in rows:
-            target = "enqueued" if d["b_status"] == "active" else "dropped"
-            db.cas(self.conn,
-                   "UPDATE deliveries SET state=?, lease_token=NULL, lease_epoch=NULL, "
-                   "lease_pid=NULL, lease_start=NULL, lease_until=NULL "
-                   "WHERE delivery_seq=? AND state='leased' AND lease_until<?",
-                   (target, d["delivery_seq"], now))
+        """r2-M3:处置=单条 CAS,active 判定在同一语句内(EXISTS)——
+        读-判-写不再分离,与并发 unbind 交错时必落 dropped 而非复活 enqueued。"""
+        self.conn.execute(
+            "UPDATE deliveries SET "
+            "state = CASE WHEN EXISTS(SELECT 1 FROM bindings b "
+            "  WHERE b.binding_id=deliveries.binding_id AND b.status='active') "
+            "  THEN 'enqueued' ELSE 'dropped' END, "
+            "lease_token=NULL, lease_epoch=NULL, lease_pid=NULL, lease_start=NULL, "
+            "lease_until=NULL "
+            "WHERE state='leased' AND lease_until IS NOT NULL AND lease_until<?",
+            (now,))
+
+    def _sweep_stranded_enqueued(self, now):
+        """r2-M3 防御性:终态绑定上滞留的 enqueued(理论不应再有)→ dropped。"""
+        cur = self.conn.execute(
+            "UPDATE deliveries SET state='dropped' WHERE state='enqueued' "
+            "AND EXISTS(SELECT 1 FROM bindings b WHERE b.binding_id=deliveries.binding_id "
+            "AND b.status IN ('dead','closed'))")
+        if cur.rowcount:
+            db.bump_counter(self.conn, "stranded_enqueued_dropped", cur.rowcount)
 
     def _legacy_sending(self, now):
         self.conn.execute(

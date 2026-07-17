@@ -70,12 +70,20 @@ def sender_of(snap):
 
 
 class Inbound:
-    def __init__(self, conn, cfg, runner, clock, media_root):
+    def __init__(self, conn, cfg, runner, clock, media_root, heartbeat=None):
         self.conn = conn
         self.cfg = cfg
         self.runner = runner
         self.clock = clock
         self.media_root = media_root
+        self.heartbeat = heartbeat  # r2-M1②:含网络条目处理完 touch last_loop_at
+
+    def _beat(self):
+        if self.heartbeat is not None:
+            try:
+                self.heartbeat()
+            except Exception:
+                pass
 
     # ---------------- 入站事件 ----------------
     def process_event(self, ev):
@@ -84,6 +92,10 @@ class Inbound:
             return
         if ev.get("chat_type") and ev.get("chat_type") != "group":
             return  # 只管 group
+        # E2:chat_allowlist 灰度门 —— 任何 inbox/notice 之前,零副作用零回复
+        allow = self.cfg.get("chat_allowlist")
+        if allow and ev.get("chat_id") not in allow:
+            return
         sender = ev.get("sender_id")
         if sender in (self.cfg.get("bot_open_id"), self.cfg.get("app_id")):
             return  # F9:显式过滤 bot 自发
@@ -144,12 +156,15 @@ class Inbound:
                 continue
             if st == "resolving":
                 self._drive_resolving(row)
+                self._beat()
                 return
             if st == "waiting_binding":
                 self._drive_waiting(row)
+                self._beat()
                 return
             if st == "approved_materializing":
                 self._drive_materializing(row)
+                self._beat()
                 return
             return  # 终态或 awaiting_approval(回调驱动)
 

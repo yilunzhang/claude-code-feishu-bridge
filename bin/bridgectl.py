@@ -31,8 +31,9 @@ def open_db():
 def cmd_bootstrap(args):
     clock = SystemClock()
     runner = LarkRunner(args.profile)
+    allow = [x.strip() for x in (args.chat_allowlist or "").split(",") if x.strip()] or None
     try:
-        cfg = ctl.bootstrap(runner, args.profile, clock)
+        cfg = ctl.bootstrap(runner, args.profile, clock, chat_allowlist=allow)
     except configmod.ConfigError as e:
         out({"ok": False, "error": str(e)}, 2)
     out({"ok": True, "config": {k: cfg.get(k) for k in
@@ -134,6 +135,8 @@ def main():
     sub = p.add_subparsers(dest="cmd", required=True)
     sp = sub.add_parser("bootstrap")
     sp.add_argument("--profile", required=True)
+    sp.add_argument("--chat-allowlist", default=None,
+                    help="逗号分隔 chat_id 列表;缺省=不限制(E2 灰度/测试隔离)")
     sp.set_defaults(fn=cmd_bootstrap)
     sp = sub.add_parser("preflight")
     sp.set_defaults(fn=cmd_preflight)

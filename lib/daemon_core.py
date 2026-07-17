@@ -172,6 +172,7 @@ class ConsumerManager:
         if c.exited:
             return
         c.exited = True
+        c.ready = False  # r2-m2:退出即不再 ready(daemon_state 由 on_status 同步)
         now = self.clock.mono_ms()
         stable = c.started_at is not None and now - c.started_at >= STABLE_RUN_MS
         if stable:
@@ -231,10 +232,26 @@ class ConsumerManager:
             pass
 
 
+def make_status_writer(conn, log):
+    """r2-m2:consumer 状态 → daemon_state 同步(ready 置位/清除 + restart 计数)。"""
+    def on_status(key, status, detail):
+        log(f"consumer[{key}] {status}: {detail}")
+        if status == "ready":
+            db.set_state(conn, f"consumer_{key}_ready", f"ready {detail}"[:200])
+        elif status in ("exited", "rapid-exit-alert", "spawn-failed"):
+            db.set_state(conn, f"consumer_{key}_ready", "down")
+            db.set_state(conn, f"consumer_{key}_last_status", f"{status} {detail}"[:200])
+            db.bump_counter(conn, f"consumer_{key}_restarts")
+        else:
+            db.set_state(conn, f"consumer_{key}_last_status", f"{status} {detail}"[:200])
+    return on_status
+
+
 class DaemonCore:
     """事件路由 + 节奏编排(可测:route_line / loop_iteration 均纯函数式入口)。"""
 
-    def __init__(self, conn, cfg, clock, inbound, approval, outbound, recovery, log=None):
+    def __init__(self, conn, cfg, clock, inbound, approval, outbound, recovery, log=None,
+                 gate=None):
         self.conn = conn
         self.cfg = cfg
         self.clock = clock
@@ -243,6 +260,7 @@ class DaemonCore:
         self.outbound = outbound
         self.recovery = recovery
         self.log = log or (lambda s: None)
+        self.gate = gate  # r2-M2:每循环发送前先 gate.tick(复检/重探)
         self._last_fast = 0
         self._last_slow = 0
         self._last_checkpoint = 0
@@ -291,6 +309,8 @@ class DaemonCore:
         else:
             # 每轮仍推进 waiting 行与激活(轻量)
             self.inbound.drive_waiting_rows()
+        if self.gate is not None:
+            self.gate.tick()  # r2-M2:门检查先于出站(漂移 → 本循环零发送)
         self.outbound.tick()
         if now - self._last_slow >= constants.RECOVERY_INTERVAL_MS or self._last_slow == 0 \
                 or now < self._last_slow:

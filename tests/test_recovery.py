@@ -261,3 +261,53 @@ class TestRetentionSymlinkHardening:
         os.symlink(victim, env.media_root / bid / "om_sym")
         env.recovery.slow_tick()
         assert (victim / "precious.txt").exists()  # 受害目录不被清
+
+
+class TestLeaseReclaimRace:
+    """r2-M3:超时 lease 处置=单条 CAS(语句内 EXISTS 判 active);与 unbind 并发必落 dropped。"""
+
+    def test_concurrent_unbind_between_read_and_write_drops(self, env):
+        from lib import db as dblib, paths
+        bid = env.make_binding(status="active")
+        env.conn.execute(
+            "INSERT INTO inbox(event_id,message_id,chat_id,binding_id,state,ts) "
+            "VALUES('ev_1','om_1',?,?,'enqueued',0)", (CHAT, bid))
+        env.conn.execute(
+            "INSERT INTO deliveries(binding_id,message_id,payload_json,state,lease_token,"
+            "lease_epoch,lease_until,attempts) VALUES(?,'om_1','{}','leased','tok',1,?,1)",
+            (bid, env.clock.wall_ms() - 1))
+        # 第二连接(bridgectl 进程)在 reclaim 写之前提交 unbind
+        conn2 = dblib.connect(paths.db_path())
+        from lib import lifecycle as lc
+        assert lc.terminate_binding(conn2, bid, "user_unbind", env.clock)
+        conn2.close()
+        env.recovery.slow_tick()
+        d = env.deliveries(bid)[0]
+        assert d["state"] == "dropped"  # 绝不复活成 enqueued
+
+    def test_rearm_checks_binding_active_in_statement(self, env):
+        """r2-M3 附带:approval 重臂对已终止绑定不重臂。"""
+        from tests.test_approval import member_pending
+        p = member_pending(env)
+        key = jobs.key_card(p["pending_id"])
+        env.conn.execute(
+            "UPDATE outbound_jobs SET state='failed', attempt_count=1 WHERE idempotency_key=?",
+            (key,))
+        # 直接置绑定终态(绕过级联,模拟窗口:pending 行未被级联 expire)
+        env.conn.execute("UPDATE bindings SET status='closed', close_reason='cc_gone'")
+        env.recovery.slow_tick()
+        assert env.conn.execute(
+            "SELECT state FROM outbound_jobs WHERE idempotency_key=?",
+            (key,)).fetchone()[0] == "failed"
+
+    def test_stranded_enqueued_on_terminal_binding_swept(self, env):
+        """r2-M3 防御性:终态绑定上滞留的 enqueued(理论不应有)→ dropped。"""
+        bid = env.make_binding(status="closed", close_reason="cc_gone")
+        env.conn.execute(
+            "INSERT INTO inbox(event_id,message_id,chat_id,binding_id,state,ts) "
+            "VALUES('ev_1','om_1',?,?,'enqueued',0)", (CHAT, bid))
+        env.conn.execute(
+            "INSERT INTO deliveries(binding_id,message_id,payload_json,state) "
+            "VALUES(?,'om_1','{}','enqueued')", (bid,))
+        env.recovery.slow_tick()
+        assert env.deliveries(bid)[0]["state"] == "dropped"

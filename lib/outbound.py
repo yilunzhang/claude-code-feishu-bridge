@@ -7,11 +7,12 @@ NOTICE_KINDS = ("decision_notice", "lifecycle_notice", "unsupported_notice", "in
 
 
 class Outbound:
-    def __init__(self, conn, cfg, runner, clock):
+    def __init__(self, conn, cfg, runner, clock, heartbeat=None):
         self.conn = conn
         self.cfg = cfg
         self.runner = runner
         self.clock = clock
+        self.heartbeat = heartbeat  # r2-M1②:每次发送完 touch last_loop_at
 
     # ------------------------------------------------------------------
     def startup_scan(self):
@@ -40,6 +41,11 @@ class Outbound:
             if self._prepare(job) == "send":
                 self._send_and_finalize(job["job_id"])
                 sends += 1
+                if self.heartbeat is not None:
+                    try:
+                        self.heartbeat()
+                    except Exception:
+                        pass
         return sends
 
     # ------------------------------------------------------------------

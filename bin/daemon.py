@@ -12,7 +12,7 @@ from lib import config as configmod  # noqa: E402
 from lib import constants, db, paths, procs, util  # noqa: E402
 from lib.approval import Approval  # noqa: E402
 from lib.clock import SystemClock  # noqa: E402
-from lib.daemon_core import ConsumerManager, DaemonCore  # noqa: E402
+from lib.daemon_core import ConsumerManager, DaemonCore, make_status_writer  # noqa: E402
 from lib.inbound import Inbound  # noqa: E402
 from lib.outbound import Outbound  # noqa: E402
 from lib.recovery import Recovery  # noqa: E402
@@ -58,19 +58,19 @@ def main():
                  f"({db.get_state(conn, 'outbound_gate')}); 入站照常入库,带退避重探")
 
     prober = procs.SystemProber()
-    inbound = Inbound(conn, cfg, runner, clock, paths.media_root())
-    outbound = Outbound(conn, cfg, runner, clock)
+
+    def heartbeat():
+        # r2-M1②:多点心跳 —— 含网络条目处理完即 touch,长下载不会被误判挂死
+        db.set_state(conn, "last_loop_at", clock.wall_ms())
+
+    inbound = Inbound(conn, cfg, runner, clock, paths.media_root(), heartbeat=heartbeat)
+    outbound = Outbound(conn, cfg, runner, clock, heartbeat=heartbeat)
     approval = Approval(conn, cfg, clock, inbound=inbound)
     recovery = Recovery(conn, cfg, runner, clock, inbound, prober)
-    core = DaemonCore(conn, cfg, clock, inbound, approval, outbound, recovery, log=log_line)
+    core = DaemonCore(conn, cfg, clock, inbound, approval, outbound, recovery,
+                      log=log_line, gate=gate)  # r2-M2:gate.tick 在 loop 内先于出站
 
-    def on_status(key, status, detail):
-        log_line(f"consumer[{key}] {status}: {detail}")
-        db.set_state(conn, f"consumer_{key}_{'ready' if status == 'ready' else 'last_status'}",
-                     f"{status} {detail}"[:200])
-        if status in ("exited", "rapid-exit-alert", "spawn-failed"):
-            db.bump_counter(conn, f"consumer_{key}_restarts")
-
+    on_status = make_status_writer(conn, log_line)  # r2-m2:ready 置位/清除同步 daemon_state
     mgr = ConsumerManager(cfg["profile"], clock,
                           on_line=core.route_line, on_status=on_status)
 
@@ -87,6 +87,7 @@ def main():
     # 修复项5:记录本进程 (pid, ps lstart) 供 ensure-daemon 挂死接管做精确身份匹配
     ident = procs.self_identity(prober, os.getpid())
     db.set_state(conn, "daemon_proc_start", ident[1] if ident else "")
+    heartbeat()  # r2-M1③:先写首次心跳,再跑可能耗时的 startup 扫描/慢恢复
     outbound.startup_scan()
     recovery.slow_tick()
     mgr.start_all()
@@ -94,8 +95,7 @@ def main():
     try:
         while not stop["flag"]:
             mgr.poll(1.0)
-            core.loop_iteration()
-            gate.tick()  # degraded 时按退避重探,全 ok 自动开门
+            core.loop_iteration()  # 内含 gate.tick(先于出站)
             mgr.tick()
     finally:
         log_line("daemon shutting down")

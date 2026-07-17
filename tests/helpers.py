@@ -47,7 +47,8 @@ def err_envelope(code, msg="err"):
 
 class FakeRunner:
     """可注入 lark-cli runner。responders: list of (predicate(args)->bool, fn(args, cwd)->FakeRunResult)。
-    未匹配调用默认抛 AssertionError(离线铁律:绝不静默放过未预期的外呼)。"""
+    未匹配调用默认抛 AssertionError(离线铁律:绝不静默放过未预期的外呼)。
+    按 LarkRunner 真实语义模拟 --profile 拖尾(E1:no_profile=True 不拖尾)。"""
 
     def __init__(self, profile="main"):
         self.profile = profile
@@ -67,8 +68,10 @@ class FakeRunner:
 
         return self.on(pred, fn)
 
-    def run(self, args, timeout_s=None, cwd=None):
+    def run(self, args, timeout_s=None, cwd=None, no_profile=False):
         args = list(args)
+        if not no_profile:
+            args = args + ["--profile", self.profile]
         self.calls.append((args, cwd))
         for pred, fn in self.responders:
             if pred(args):

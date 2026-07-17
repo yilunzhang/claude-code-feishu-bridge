@@ -277,3 +277,43 @@ class TestSessionEnd:
             {"session_id": "sess-1"}, conn=env.conn, prober=env.prober,
             clock=env.clock, start_pid=HOOK_PID)
         assert pb(env, res["binding_id"])["latch_open"] == 0
+
+
+class TestSupersedeLatchMatrix:
+    """r2-m1:consumed+latch_open 的旧 bind 被 supersede → 一并关闩;
+    新 bind 的 Stop 即使是 continuation(stop_hook_active=true)也能正常握手。
+    nonce-miss 的留闩语义不变(TestHandshake.test_nonce_mismatch_fails_bind_with_latch 覆盖)。"""
+
+    def test_superseded_consumed_tombstone_latch_closed(self, hook_env):
+        env = hook_env
+        # 旧 bind:握手成功但 listener 未就绪 → starting confirmed + consumed latch=1
+        old = start_bind(env, with_listener=False)
+        r = stop(env, msg=old["marker"])
+        assert r["suppressed"] and pb(env, old["binding_id"])["latch_open"] == 1
+        assert binding(env, old["binding_id"])["status"] == "starting"
+        # 同实例重新 bind → supersede 关闭旧 starting 并关旧 tombstone 的闩
+        new = start_bind(env)
+        old_pb = pb(env, old["binding_id"])
+        assert old_pb["latch_open"] == 0  # supersede 场景一并关闩
+        assert binding(env, old["binding_id"])["close_reason"] == "bind_superseded"
+
+    def test_new_bind_handshake_works_on_continuation_stop(self, hook_env):
+        env = hook_env
+        old = start_bind(env, with_listener=False)
+        stop(env, msg=old["marker"])  # 旧 latch 开
+        new = start_bind(env)  # supersede → 旧 latch 关
+        # 新 bind 的回复 Stop 是 continuation(其它阻断型 hook 先跑过)
+        r = stop(env, msg=f"确认 {new['marker']}", sha=True)
+        assert r["suppressed"] and r["reason"] == "bind-handshake"
+        p_new = pb(env, new["binding_id"])
+        assert p_new["state"] == "consumed" and p_new["latch_open"] == 1
+        b_new = binding(env, new["binding_id"])
+        assert b_new["status"] == "active"  # 新 listener 就绪 → 激活
+
+    def test_nonce_miss_latch_still_preserved_after_unrelated_supersede(self, hook_env):
+        """对照:nonce-miss 关不掉的闩只归 supersede 场景管,其余终止路径不动已终态行的闩。"""
+        env = hook_env
+        res = start_bind(env)
+        stop(env, msg="没有 marker 的回复")  # nonce-miss → failed + latch=1
+        p = pb(env, res["binding_id"])
+        assert p["state"] == "failed" and p["latch_open"] == 1

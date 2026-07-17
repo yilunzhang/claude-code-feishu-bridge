@@ -183,3 +183,82 @@ class TestConsumerRespawnHygiene:
             mgr.poll(0.2)
         mgr.shutdown()
         assert json.loads(lines[0]) == {"n": 1}  # 无旧半行拼接污染
+
+
+class TestMultiPointHeartbeat:
+    """r2-M1②:含网络条目处理完即 touch last_loop_at,长下载不饿死心跳。"""
+
+    def _beat_fn(self, env):
+        def beat():
+            dbmod.set_state(env.conn, "last_loop_at", env.clock.wall_ms())
+        return beat
+
+    def test_inbound_beats_after_long_download(self, env):
+        from tests.helpers import bot_mention, mget_snapshot, ok_envelope
+        from tests.conftest import OWNER, APP_ID
+        env.inbound.heartbeat = self._beat_fn(env)
+        env.make_binding(status="active")
+        dbmod.set_state(env.conn, "last_loop_at", env.clock.wall_ms())
+
+        def slow_mget(args, cwd):
+            env.clock.tick(200_000)  # 模拟 200s 慢网络
+            return ok_envelope({"messages": [mget_snapshot(
+                "om_1", CHAT, OWNER, mentions=[bot_mention(APP_ID)])]})
+
+        env.runner.on(lambda a: a[:2] == ["im", "+messages-mget"], slow_mget)
+        env.recv_event()
+        last = int(dbmod.get_state(env.conn, "last_loop_at"))
+        assert env.clock.wall_ms() - last < 1000  # 处理完即刷新
+        from lib import ctl
+        import lib.ctl as ctlmod
+        # 多点心跳后 daemon_healthy 不误判挂死
+        assert (env.clock.wall_ms() - last) <= ctlmod.HUNG_THRESHOLD_MS
+
+    def test_outbound_beats_between_sends(self, env):
+        from tests.helpers import ok_envelope
+        from lib import jobs
+        env.outbound.heartbeat = self._beat_fn(env)
+        bid = env.make_binding(status="active")
+
+        def slow_send(args, cwd):
+            env.clock.tick(25_000)
+            return ok_envelope({"message_id": "om_x" + str(env.clock.wall_ms())})
+
+        env.runner.on_prefix(["im", "+messages-send"], slow_send)
+        for i in range(3):
+            jobs.create_job(env.conn, kind="session_turn", chat_id=CHAT, binding_id=bid,
+                            idempotency_key=f"turn:g{i}:0", turn_group=f"g{i}",
+                            chunk_index=0, body="x", now=env.clock.wall_ms())
+        env.outbound.tick()
+        last = int(dbmod.get_state(env.conn, "last_loop_at"))
+        assert env.clock.wall_ms() - last < 1000
+
+
+class TestConsumerReadyObservability:
+    """r2-m2:退出/teardown 清 ready 并同步 daemon_state。"""
+
+    def test_ready_cleared_on_teardown(self, env):
+        import sys as _sys
+        statuses = []
+        clock = FakeClock()
+        mgr = ConsumerManager(
+            "main", clock, on_line=lambda k, l: None,
+            on_status=lambda k, s, d: statuses.append((s, d)), keys=("k1",),
+            argv_builder=lambda key: [_sys.executable, "-u", "-c", CHILD_EXIT])
+        mgr.start_all()
+        deadline = time.time() + 5
+        while time.time() < deadline and not mgr.consumers["k1"].exited:
+            mgr.poll(0.2)
+            mgr.tick()
+        assert mgr.consumers["k1"].ready is False
+        mgr.shutdown()
+
+    def test_status_writer_syncs_daemon_state(self, env):
+        from lib.daemon_core import make_status_writer
+        writer = make_status_writer(env.conn, log=lambda s: None)
+        writer("im.message.receive_v1", "ready", "[event] ready")
+        assert dbmod.get_state(env.conn, "consumer_im.message.receive_v1_ready").startswith("ready")
+        writer("im.message.receive_v1", "exited", "restarts=1")
+        assert dbmod.get_state(env.conn, "consumer_im.message.receive_v1_ready") == "down"
+        assert int(dbmod.get_state(env.conn,
+                                   "consumer_im.message.receive_v1_restarts", "0")) == 1

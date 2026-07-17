@@ -20,7 +20,9 @@ class RunResult:
 
 
 class LarkRunner:
-    """一次性 REST 调用。event consume 常驻消费不走这里(见 daemon_core.ConsumerManager)。"""
+    """一次性 REST 调用。event consume 常驻消费不走这里(见 daemon_core.ConsumerManager)。
+    E1(真机实锤):顶层元命令 `--version` 不吃全局 --profile(拖尾 → unknown command rc=2)
+    → 用 no_profile=True 走裸 argv;其余 im/api/auth/event 子命令均接受全局 --profile(已审计)。"""
 
     def __init__(self, profile, lark_bin="lark-cli"):
         if not profile:
@@ -28,8 +30,14 @@ class LarkRunner:
         self.profile = profile
         self.lark_bin = lark_bin
 
-    def run(self, args, timeout_s=constants.SEND_TIMEOUT_S, cwd=None):
-        argv = [self.lark_bin] + [str(a) for a in args] + ["--profile", self.profile]
+    def build_argv(self, args, no_profile=False):
+        argv = [self.lark_bin] + [str(a) for a in args]
+        if not no_profile:
+            argv += ["--profile", self.profile]
+        return argv
+
+    def run(self, args, timeout_s=constants.SEND_TIMEOUT_S, cwd=None, no_profile=False):
+        argv = self.build_argv(args, no_profile=no_profile)
         try:
             p = subprocess.Popen(
                 argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
