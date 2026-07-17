@@ -26,7 +26,7 @@ hooks(Stop/SessionEnd)由 plugin 的 `hooks/hooks.json` **自带**——安装 p
      ```bash
      python3 "${CLAUDE_SKILL_DIR}/../../bin/bridgectl.py" bootstrap --profile <名>
      ```
-   - `hooks.seen=false`(尚未检测到 plugin hooks 心跳)→ 这在**全新安装 / 尚未完成一轮对话**时是正常的。**不需要**手改 settings.json;若用户刚 `/plugin install` 或更新了 feishu-bridge,提醒**重启 Claude Code** 让 hooks 生效(重启后随便完成一轮对话就会记录心跳)。bind 仍可继续(见下)。
+   - `hooks.confirmed=false`(未确认 plugin hooks 已生效;细看 `hooks.stop.{seen,fresh,current}`——缺失/过旧/来自另一 install)→ 这在**全新安装 / 尚未完成一轮对话**时是正常的。**不需要**手改 settings.json;若用户刚 `/plugin install` 或更新了 feishu-bridge,提醒**重启 Claude Code** 让 hooks 生效(重启后随便完成一轮对话就会记录 Stop 心跳)。心跳仅 advisory;bind 仍可继续(见下)。
    - 输出带 `warning`(存在其它 Stop hook)→ 转告用户该已声明限制,可继续。
 
 2. **选群**:

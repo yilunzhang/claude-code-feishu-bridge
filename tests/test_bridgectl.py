@@ -226,3 +226,116 @@ class TestListenerCmdShlex:
         assert argv[-2] == str(spaced / "bin" / "listener.py")
         assert argv[-1] == res["binding_id"]
         assert "my plugins" in argv[-2]  # 空格保留在单一 argv 里(未被拆开)
+
+
+class TestReconcileCodeIdentity:
+    """MAJOR 3 换层:code-identity 检测=**bind 前置串行检查**(不在 supervisor)。
+    reconcile_code_identity 全注入依赖,可测。"""
+
+    def _fakes(self, *, held=True, recorded="rootA|1.0.0", pid=5555, pstart="s",
+               alive=True):
+        from tests.helpers import FakeProber
+        prober = FakeProber()
+        if alive and pid is not None:
+            prober.set(pid, 1, pstart, "python3")
+        world = {"held": held, "kills": [], "ensures": 0}
+
+        def lock_held():
+            return world["held"]
+
+        def read_state():
+            return {"daemon_code_identity": recorded, "daemon_pid": pid,
+                    "daemon_proc_start": pstart}
+
+        def kill(p, sig):
+            world["kills"].append((p, sig))
+            world["held"] = False  # SIGTERM → daemon 退出释放 flock
+
+        def ensure():
+            world["ensures"] += 1
+            return "started"
+
+        return world, prober, lock_held, read_state, kill
+
+    def test_match_no_restart(self):
+        world, prober, lock_held, read_state, kill = self._fakes(recorded="rootA|1.0.0")
+        r = ctl.reconcile_code_identity(
+            my_identity="rootA|1.0.0", read_state=read_state, lock_held=lock_held,
+            prober=prober, kill=kill, ensure=lambda: "started", sleep=lambda s: None)
+        assert r["restarted"] is False and r["reason"] == "match"
+        assert world["kills"] == []
+
+    def test_no_daemon_no_restart(self):
+        world, prober, lock_held, read_state, kill = self._fakes(held=False)
+        r = ctl.reconcile_code_identity(
+            my_identity="rootA|1.0.0", read_state=read_state, lock_held=lock_held,
+            prober=prober, kill=kill, ensure=lambda: "started", sleep=lambda s: None)
+        assert r["restarted"] is False and r["reason"] == "no-daemon"
+
+    def test_mismatch_restarts_old_daemon(self):
+        world, prober, lock_held, read_state, kill = self._fakes(
+            recorded="rootOLD|0.9.0", pid=5555, pstart="s", alive=True)
+        r = ctl.reconcile_code_identity(
+            my_identity="rootNEW|1.0.0", read_state=read_state, lock_held=lock_held,
+            prober=prober, kill=kill, ensure=lambda: "started", sleep=lambda s: None,
+            wait_s=2)
+        assert r["restarted"] is True and r["old"] == "rootOLD|0.9.0" and r["new"] == "rootNEW|1.0.0"
+        assert world["kills"] == [(5555, __import__("signal").SIGTERM)]  # 精确 SIGTERM
+        assert r["state"] == "started"
+
+    def test_mismatch_dead_pid_no_kill(self):
+        """记录的旧 daemon pid 已死/复用 → 不杀随机进程(与冷启动竞态同类),bind 继续。"""
+        world, prober, lock_held, read_state, kill = self._fakes(
+            recorded="rootOLD|0.9.0", pid=5555, pstart="s", alive=False)
+        r = ctl.reconcile_code_identity(
+            my_identity="rootNEW|1.0.0", read_state=read_state, lock_held=lock_held,
+            prober=prober, kill=kill, ensure=lambda: "started", sleep=lambda s: None)
+        assert r["restarted"] is False and r["reason"] == "stale-daemon-unverified"
+        assert world["kills"] == []
+
+    def test_mismatch_no_recorded_pid_no_kill(self):
+        world, prober, lock_held, read_state, kill = self._fakes(
+            recorded="rootOLD|0.9.0", pid=None, pstart=None)
+        r = ctl.reconcile_code_identity(
+            my_identity="rootNEW|1.0.0", read_state=read_state, lock_held=lock_held,
+            prober=prober, kill=kill, ensure=lambda: "started", sleep=lambda s: None)
+        assert r["restarted"] is False and world["kills"] == []
+
+    def test_mismatch_daemon_wont_exit_surfaces_error(self):
+        """SIGTERM 后 flock 未释放(旧 daemon 不退出)→ 明确 error,不 ensure。"""
+        from tests.helpers import FakeProber
+        prober = FakeProber()
+        prober.set(5555, 1, "s", "python3")
+        ensures = {"n": 0}
+
+        def kill(p, sig):
+            pass  # daemon 不退出:锁一直持有
+
+        r = ctl.reconcile_code_identity(
+            my_identity="rootNEW|1.0.0",
+            read_state=lambda: {"daemon_code_identity": "rootOLD|0.9.0",
+                                "daemon_pid": 5555, "daemon_proc_start": "s"},
+            lock_held=lambda: True, prober=prober, kill=kill,
+            ensure=lambda: ensures.__setitem__("n", ensures["n"] + 1),
+            sleep=lambda s: None, wait_s=1)
+        assert r["restarted"] is False and "error" in r and r["reason"] == "no-exit"
+        assert ensures["n"] == 0  # 没拉新 daemon
+
+
+def test_bump_drop_counter_uses_short_obs_timeout(data_dir, monkeypatch):
+    """minor②:可观测计数用短等锁(BUSY_TIMEOUT_OBS_MS),不叠加拖住 CC 退出。"""
+    from lib import hooklib, db as dbmod, constants, paths as pathsmod
+    pathsmod.ensure_data_dir()
+    captured = {}
+    real_connect = dbmod.connect
+
+    def spy_connect(dbfile, busy_timeout_ms=None, **kw):
+        captured["busy"] = busy_timeout_ms
+        return real_connect(dbfile, busy_timeout_ms=busy_timeout_ms, **kw)
+
+    monkeypatch.setattr(dbmod, "connect", spy_connect)
+    # 需要 db 存在
+    c = real_connect(pathsmod.db_path()); dbmod.init_schema(c, pathsmod.schema_path()); c.close()
+    hooklib._bump_drop_counter()
+    assert captured["busy"] == constants.BUSY_TIMEOUT_OBS_MS
+    assert constants.BUSY_TIMEOUT_OBS_MS < constants.BUSY_TIMEOUT_SESSION_END_MS

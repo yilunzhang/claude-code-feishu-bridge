@@ -63,6 +63,8 @@ BUSY_TIMEOUT_DAEMON_MS = 5_000
 BUSY_TIMEOUT_HOOK_MS = 3_000
 # minor③:SessionEnd 关绑定 best-effort(daemon cc_gone 兜底)→ 更短等锁,锁竞争时快速让路。
 BUSY_TIMEOUT_SESSION_END_MS = 1_500
+# minor②:可观测计数(hook_drop_count)用极短等锁 —— 拿不到就算了,绝不叠加拖住 CC 退出。
+BUSY_TIMEOUT_OBS_MS = 300
 BUSY_TIMEOUT_LISTENER_MS = 3_000
 
 SCHEMA_VERSION = "1"

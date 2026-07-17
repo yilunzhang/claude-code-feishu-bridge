@@ -103,6 +103,16 @@ def cmd_bind(args):
             out({"ok": False, "retryable": True, "daemon": state,
                  "error": "daemon 正在启动(尚未就绪),请稍候重跑 /feishu-bridge:bridge bind"}, 5)
         out({"ok": False, "daemon": state, "error": "daemon 拉起失败,看 daemon.log"}, 2)
+    # MAJOR 3(换层):bind 前置**串行** code-identity 检查(daemon 健康之后、建 pending_bind 之前)。
+    # 检测「plugin 更新/迁移后复用跑旧代码的旧 daemon」→ 安全重启本版本的。
+    reconcile = ctl.reconcile_daemon_code_identity()
+    if reconcile.get("error"):
+        out({"ok": False, "code_identity": reconcile, "error": reconcile["error"]}, 6)
+    if reconcile.get("restarted"):
+        state = reconcile.get("state", state)
+        if not ctl.is_ready_result(state):
+            out({"ok": False, "daemon": state, "code_identity": reconcile,
+                 "error": "检测到旧版本 daemon 已重启,但新 daemon 未就绪;请稍候重跑 bind"}, 5)
     conn = open_db()
     clock = SystemClock()
     try:
@@ -113,6 +123,7 @@ def cmd_bind(args):
         out({"ok": False, "error": str(e), "code": e.code}, 4)
     res["ok"] = True
     res["daemon"] = state
+    res["code_identity"] = reconcile
     res["hooks"] = hooks
     if not hooks["confirmed"]:
         # advisory:以 Stop 心跳 seen∧fresh∧current(confirmed)为条件,不只看 seen(MAJOR 2)。

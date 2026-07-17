@@ -54,7 +54,9 @@ python3 <plugin根>/bin/bridgectl.py bootstrap --profile <lark-cli profile 名> 
    bind 列外群直接报错;出站兜底(列外 job 一律 cancelled)。缺省/空 = 不限制(plan 语义)。
    改动 allowlist 需编辑 `config.json` 后重启 daemon 生效;`status` 会显示当前值。
 
-**C. 更新 / 迁移**(plugin 版本升级、marketplace 换安装根、或从旧 standalone 迁来):daemon 是 detached 常驻,可能仍跑**旧代码**并与新 hook/新 CLI 共用同一 `bridge.db`。处理:**更新后重启 CC**,下次 `bind` 时 CLI 会比对自己的代码身份(`pkg_root|plugin_version|git`)与 daemon 启动时记录的 `daemon_code_identity`,**不一致则自动安全重启旧 daemon**(SIGTERM→等退出→拉起新的)。想手动先停:`pkill -f feishu-bridge/bin/daemon.py`(SIGTERM),再 bind。
+**C. 更新 / 迁移**(plugin 版本升级、marketplace 换安装根、或从旧 standalone 迁来):daemon 是 detached 常驻,可能仍跑**旧代码**并与新 hook/新 CLI 共用同一 `bridge.db`。处理:**更新后重启 CC**,下次 `bind` 时 CLI 在建绑定前做一步**串行 code-identity 检查**——比对自己的代码身份(`pkg_root|plugin_version`,pkg_root 换根或 version 变都会检测到)与 daemon 启动时记录的 `daemon_code_identity`,**不一致则自动安全重启旧 daemon**(精确 pid+start 匹配 SIGTERM→等 flock 释放→拉起本版本新的)。
+- 想手动先停:先 `... status` 看 `daemon.pid`,再 `kill <pid>`;或 `pkill -f 'feishu-bridge.*/bin/daemon\.py'`(正则兼容 marketplace 的版本目录 `.../feishu-bridge/<version>/bin/daemon.py`)。
+- **dev 注意**:同一目录改代码但不改 `plugin.json` 的 version → identity 不变、检测不到,dev 自己手动重启 daemon(或 bump version)。
 
 ## 用法
 
@@ -114,6 +116,7 @@ cd <plugin根> && python3 -m pytest tests/ -q
   - **不影响安全**:机械审批门、未绑定不外发、allowlist 全部不受此竞态影响。
   - 已做的**缩窗+可观测**(非根治):busy waiter 等待上限覆盖 owner 最坏临界区(2*wait_s+probe_wait_s)且到期返回结构化 `in_progress`(bind 靠 `is_ready_result` 判定,不误当成功);daemon 退出安全点写 `startup=stopping` 且退出后不再刷心跳,supervisor 由此更快判定其停摆。**未做**(by-design):fencing/desired_generation 持久化、单行状态快照重构、launchd。
 - **🅑 S6:daemon/总线离线期间群消息不重放**:daemon 停摆或 lark-cli event bus WS 断线期间,群里 @bot 的消息**会丢失且无回执**(S6 已实证不重放);靠下次 bind / listener 的 daemon 自愈行拉起后恢复,历史消息不补投。轻量应用可接受。
+- **🅒 两个不同 identity 的 CLI 并发 bind(by-design 已知限制)**:bind 前置 code-identity 检查是**串行**做的(不在 supervisor 并发层),没为「同时开两个装了不同 plugin 版本/位置的 CC session、几乎同时 bind」这一极罕见场景加严格串行化(与 🅐 冷启动竞态同类)。后果:两者可能互相重启对方的 daemon 打转几次,最终收敛;不影响安全(机械审批门/未绑定不外发/allowlist 无洞)。个人使用几乎不触发。
 - **v1 不做**:thread 出站回复(审批卡的 reply 除外)、reaction 快捷审批、消息编辑/撤回跟踪、topic 群、离线自动补投(见 🅑;LaunchAgent 已决不做,见 🅐)、长输出转文件、卡片原地更新(晚点击无卡片刷新,结果以文本通知)、原子换绑、消费级 ACK、post 内嵌图片(只取文本)、多 profile 多桥。
 - **投递语义**:delivery `emitted` = 已写入 Monitor stdout 管道;到模型 = at-least-once(payload 带 message_id,session 按 id 跳重)。Monitor 可能合并连发的行。
 - **unbind 线性化**:以各 CAS 提交为线性化点;unbind 提交前已进入 `sending` 的 job / 已 `leased` 的 delivery 允许其后完成(各至多 1 件在途),此后零新增。

@@ -85,7 +85,9 @@ def session_end_entry(payload, conn=None, prober=None, clock=None, start_pid=Non
 
 def _bump_drop_counter():
     try:
-        c = db.connect(paths.db_path(), busy_timeout_ms=constants.BUSY_TIMEOUT_HOOK_MS)
+        # minor②:可观测计数用**短等锁**(BUSY_TIMEOUT_OBS_MS)——否则 SessionEnd 首次等锁失败(1.5s)
+        # 后又用 3s 等锁补 counter = 总 ~4.5s,会拖住 CC 退出。计数只是观测,拿不到锁就算了。
+        c = db.connect(paths.db_path(), busy_timeout_ms=constants.BUSY_TIMEOUT_OBS_MS)
         try:
             db.bump_counter(c, "hook_drop_count")
         finally:

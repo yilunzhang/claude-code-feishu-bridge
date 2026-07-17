@@ -4,6 +4,7 @@ import fcntl
 import json
 import os
 import shlex
+import signal
 import subprocess
 import sys
 import time
@@ -377,15 +378,15 @@ class DaemonSupervisor:
 
     def __init__(self, *, lock_held, read_state, spawn, kill, prober,
                  now_ms, sleep, wait_s=12, singleflight=None, probe_wait_s=None,
-                 mono_ms=None, is_code_current=None):
+                 mono_ms=None):
         self.lock_held = lock_held
         self.read_state = read_state
         self.spawn = spawn
         self.kill = kill
         self.prober = prober
-        # MAJOR 3:is_code_current(st)->bool。健康 daemon 但跑的代码身份 != 当前 CLI → 视为需重启
-        # (SIGTERM 旧 daemon → 等退出 → 拉新的);None = 不校验(既有测试/无版本约束场景)。
-        self.is_code_current = is_code_current
+        # 注:supervisor **只判 daemon 健康在跑吗**,不掺 code-identity(换层:identity 检测
+        # 移到 bind 前置串行检查,见 reconcile_code_identity)——避免在并发 ready 状态机的多个出口
+        # 各自校验(security 三律③:别在错误的层堆东西)。
         # codex-final:两个时钟各司其职,别混。
         #   now_ms = **墙钟**(wall):用于心跳新鲜度/state_ready —— last_loop_at 是 DB 持久化的
         #     墙钟时间戳,跨进程比较必须墙钟。
@@ -471,10 +472,6 @@ class DaemonSupervisor:
     def _ensure_locked(self):
         st = self.read_state()
         if self.lock_held() and self._ready(st):
-            # MAJOR 3:健康 daemon 但代码身份不符(plugin 更新/迁移后跑旧代码)→ 安全重启
-            # (SIGTERM 旧 daemon → 等退出 → 拉新的);唯一在心跳新鲜时 kill 的例外,理由=代码版本不符。
-            if self.is_code_current is not None and not self.is_code_current(st):
-                return self._takeover_and_restart(st)
             return "running"  # 稳态健康(singleflight 下无并发重启,可信)
         if self.lock_held():
             if self._heartbeat_fresh(st):
@@ -587,18 +584,60 @@ def ensure_daemon(wait_s=12, spawn=True):
                 conn.close()
         except Exception:
             return "down"
-    from . import version as versionmod
-    my_code = versionmod.code_identity_str()
     sup = DaemonSupervisor(
         lock_held=daemon_lock_held, read_state=_read_daemon_state,
         spawn=_spawn_daemon, kill=os.kill, prober=procs.SystemProber(),
         now_ms=lambda: int(time.time() * 1000),          # 墙钟:心跳/state_ready(DB 时间戳)
         mono_ms=lambda: int(time.monotonic() * 1000),    # 单调钟:等待 deadline(免疫墙钟跳变)
         sleep=time.sleep, wait_s=wait_s,
-        singleflight=_FlockSingleflight(paths.ensure_lock_path()),
-        # MAJOR 3:健康 daemon 但 daemon_code_identity != 本 CLI → 需重启(跑旧代码的旧 daemon)。
-        is_code_current=lambda st: (st or {}).get("daemon_code_identity") == my_code)
+        singleflight=_FlockSingleflight(paths.ensure_lock_path()))
     return sup.ensure()
+
+
+# ---------------------------------------------------------------- bind 前置:code-identity 串行检查(MAJOR 3 换层)
+def reconcile_code_identity(*, my_identity, read_state, lock_held, prober, kill,
+                            ensure, sleep, wait_s=12):
+    """bind 前置**串行**检查(不在 supervisor 并发层):读 daemon_state.daemon_code_identity,
+    与本 CLI code_identity_str() 比。不一致 → SIGTERM 旧 daemon(精确 pid+start;pid 复用/已死不杀)
+    → 等 flock 释放 → 重新 ensure(拉本版本新 daemon)→ 继续。一致/无 daemon → 直接继续。
+    返回 {restarted, reason, old?, new, state?, error?}。
+    两个不同 identity 的 CLI 并发 bind 的严格串行化 = 已知限制(极罕见,不在此层处理)。"""
+    st = read_state() or {}
+    if not lock_held():
+        return {"restarted": False, "reason": "no-daemon", "new": my_identity}
+    recorded = st.get("daemon_code_identity")
+    if recorded == my_identity:
+        return {"restarted": False, "reason": "match", "new": my_identity}
+    pid, pstart = st.get("daemon_pid"), st.get("daemon_proc_start")
+    if not pid or not pstart or procs.probe_alive(prober, int(pid), pstart) != procs.ALIVE:
+        # pid 复用/已死/无记录 → 不杀随机进程(与冷启动竞态同类,归已知限制);让 bind 继续
+        return {"restarted": False, "reason": "stale-daemon-unverified",
+                "old": recorded, "new": my_identity}
+    try:
+        kill(int(pid), signal.SIGTERM)
+    except OSError as e:
+        return {"restarted": False, "reason": "kill-failed", "old": recorded, "new": my_identity,
+                "error": f"检测到不同版本/位置的 daemon(旧:{recorded}),SIGTERM 失败:{e};请手动停止后重试"}
+    for _ in range(int(wait_s / _POLL_STEP_S) + 1):
+        if not lock_held():
+            break
+        sleep(_POLL_STEP_S)
+    else:
+        return {"restarted": False, "reason": "no-exit", "old": recorded, "new": my_identity,
+                "error": "旧 daemon SIGTERM 后未退出(flock 未释放);请手动停止旧 daemon 后重试(见 README)"}
+    new_state = ensure()  # 无 daemon 了 → 拉本版本的新 daemon
+    return {"restarted": True, "reason": "restarted", "old": recorded, "new": my_identity,
+            "state": new_state}
+
+
+def reconcile_daemon_code_identity(wait_s=12):
+    """生产装配:reconcile_code_identity 注入真实依赖。"""
+    from . import version as versionmod
+    return reconcile_code_identity(
+        my_identity=versionmod.code_identity_str(),
+        read_state=_read_daemon_state, lock_held=daemon_lock_held,
+        prober=procs.SystemProber(), kill=os.kill, ensure=ensure_daemon,
+        sleep=time.sleep, wait_s=wait_s)
 
 
 # ---------------------------------------------------------------- doctor(显式诊断例外,I2)
