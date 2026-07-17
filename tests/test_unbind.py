@@ -44,8 +44,11 @@ def test_zero_new_sends_after_unbind(env):
     st = {r["idempotency_key"]: r["state"] for r in env.jobs("session_turn")}
     assert st["turn:g2:0"] == "cancelled"
     sends = env.runner.calls_matching("im", "+messages-send")
-    # 只允许本次终止的 lifecycle_notice 外发
-    texts_sent = [c[0][c[0].index("--text") + 1] for c in sends]
+    # 只允许本次终止的 lifecycle_notice 外发(通知 --text;若有 session_turn 会是 --markdown)
+    def _body(argv):
+        flag = "--markdown" if "--markdown" in argv else "--text"
+        return argv[argv.index(flag) + 1]
+    texts_sent = [_body(c[0]) for c in sends]
     assert all("post-unbind" not in t for t in texts_sent)
 
 

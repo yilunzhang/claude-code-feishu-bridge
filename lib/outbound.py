@@ -242,11 +242,25 @@ class Outbound:
             return ("failed", "reaction failed")  # 失败即 failed 不重试(4.5;S11 幂等)
         wire_key = util.short_key(job["idempotency_key"])  # E4b:wire 一律短键(≤40)
         if kind == "approval_card":
+            # 成员消息预览=**不可信**文本 → 必须保持转义 interactive 卡片,绝不 markdown 渲染。
             argv = ["im", "+messages-reply", "--as", "bot",
                     "--message-id", job["reply_to"], "--msg-type", "interactive",
                     "--content", job["body"] or "{}",
                     "--idempotency-key", wire_key]
+        elif kind == "session_turn":
+            # session_turn 经 --markdown 渲染(让模型输出的 markdown 在飞书正常显示)。
+            # **安全前提(2026-07-17 Yilun 定)**:群内只有可信人员 + 接受模型输出经 --markdown 可能
+            # 自动抓取图片 URL(SSRF 面:lark-cli 会从本机抓 ![](url) 的地址,可达内网/localhost/云
+            # 元数据)/ 解析 @(@全员面)。**若将来群向不可信成员开放,必须改回 --text,或写一个
+            # md→安全 post 渲染器(不主动抓远程资源)。** 注:approval_card 的成员预览仍走转义
+            # interactive,不受此影响;通知类(lifecycle/decision/inbound/unsupported)是我们的固定
+            # 文案,继续走 --text。
+            argv = ["im", "+messages-send", "--as", "bot",
+                    "--chat-id", job["chat_id"], "--markdown", job["body"] or "",
+                    "--idempotency-key", wire_key]
         else:
+            # 通知类(lifecycle_notice/decision_notice/inbound_notice/unsupported_notice)=固定文案
+            # → 保持 --text(无需渲染,也无 markdown 主动面)。
             argv = ["im", "+messages-send", "--as", "bot",
                     "--chat-id", job["chat_id"], "--text", job["body"] or "",
                     "--idempotency-key", wire_key]

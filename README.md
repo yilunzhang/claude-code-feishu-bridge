@@ -119,6 +119,8 @@ cd <plugin根> && python3 -m pytest tests/ -q
   - 已做的**缩窗+可观测**(非根治):busy waiter 等待上限覆盖 owner 最坏临界区(2*wait_s+probe_wait_s)且到期返回结构化 `in_progress`(bind 靠 `is_ready_result` 判定,不误当成功);daemon 退出安全点写 `startup=stopping` 且退出后不再刷心跳,supervisor 由此更快判定其停摆。**未做**(by-design):fencing/desired_generation 持久化、单行状态快照重构、launchd。
 - **🅑 S6:daemon/总线离线期间群消息不重放**:daemon 停摆或 lark-cli event bus WS 断线期间,群里 @bot 的消息**会丢失且无回执**(S6 已实证不重放);靠下次 bind / listener 的 daemon 自愈行拉起后恢复,历史消息不补投。轻量应用可接受。
 - **🅒 两个不同 identity 的 CLI 并发 bind(by-design 已知限制)**:bind 前置 code-identity 检查是**串行**做的(不在 supervisor 并发层),没为「同时开两个装了不同 plugin 版本/位置的 CC session、几乎同时 bind」这一极罕见场景加严格串行化(与 🅐 冷启动竞态同类)。后果:两者可能互相重启对方的 daemon 打转几次,最终收敛;不影响安全(机械审批门/未绑定不外发/allowlist 无洞)。个人使用几乎不触发。
+- **🅓 session_turn 经 `--markdown` 渲染(安全前提,2026-07-17 Yilun 定)**:模型每轮最终输出用 `--markdown` 发送,让 markdown 在飞书正常渲染。**前提=群内只有可信人员**,并接受 `--markdown` 的主动面:lark-cli 会从本机抓取 `![](url)` 里的图片地址(**SSRF 面**,可达内网/localhost/云元数据)、并解析 `@`(@全员面)。**若将来群向不可信成员开放,必须改回 `--text`,或写一个 md→安全 post 渲染器(不主动抓远程资源)**——改动点在 `lib/outbound.py::_transmit` 的 `session_turn` 分支(那里有同样的注释)。注:通知类仍 `--text`;**审批卡的成员消息预览仍走转义 interactive**(不可信文本绝不 markdown 渲染),不受此前提影响。
+  - 小瑕疵(可接受,不修):12000 字符 chunk 边界可能切断代码围栏(` ``` ` 跨 chunk)导致该处渲染略歪。个人轻量应用不做 markdown-aware 分块(过度设计)。
 - **v1 不做**:thread 出站回复(审批卡的 reply 除外)、reaction 快捷审批、消息编辑/撤回跟踪、topic 群、离线自动补投(见 🅑;LaunchAgent 已决不做,见 🅐)、长输出转文件、卡片原地更新(晚点击无卡片刷新,结果以文本通知)、原子换绑、消费级 ACK、post 内嵌图片(只取文本)、多 profile 多桥。
 - **投递语义**:delivery `emitted` = 已写入 Monitor stdout 管道;到模型 = at-least-once(payload 带 message_id,session 按 id 跳重)。Monitor 可能合并连发的行。
 - **unbind 线性化**:以各 CAS 提交为线性化点;unbind 提交前已进入 `sending` 的 job / 已 `leased` 的 delivery 允许其后完成(各至多 1 件在途),此后零新增。

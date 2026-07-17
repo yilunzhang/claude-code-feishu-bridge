@@ -19,7 +19,13 @@ def test_full_lifecycle(env):
     sent_texts = []
 
     def send_ok(args, cwd):
-        sent_texts.append(args[args.index("--text") + 1] if "--text" in args else "<card>")
+        # session_turn 走 --markdown;通知走 --text;两者都收集
+        if "--markdown" in args:
+            sent_texts.append(args[args.index("--markdown") + 1])
+        elif "--text" in args:
+            sent_texts.append(args[args.index("--text") + 1])
+        else:
+            sent_texts.append("<card>")
         return ok_envelope({"message_id": f"om_out_{len(sent_texts)}"})
 
     env.runner.on_prefix(["im", "+messages-send"], send_ok)

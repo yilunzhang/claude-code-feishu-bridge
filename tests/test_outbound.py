@@ -43,11 +43,12 @@ class TestSendContract:
         assert row["state"] == "sent" and row["sent_message_id"] == "om_sent_1"
         args, _ = env.runner.calls_matching("im", "+messages-send")[0]
         assert args[args.index("--chat-id") + 1] == CHAT
-        assert args[args.index("--text") + 1] == "hello"
+        # session_turn 走 --markdown(可信群前提,2026-07-17),不走 --text
+        assert args[args.index("--markdown") + 1] == "hello"
+        assert "--text" not in args
         from lib import util
         wire_key = args[args.index("--idempotency-key") + 1]
         assert wire_key == util.short_key("turn:g1:0") and len(wire_key) <= 40  # E4b
-        assert "--markdown" not in args  # F6:出站禁用 markdown 主动面
 
     def test_missing_message_id_is_unknown_then_retry_same_key(self, env):
         bid = env.make_binding(status="active")
@@ -248,7 +249,7 @@ class TestOrdering:
         sent = []
 
         def fn(args, cwd):
-            body = args[args.index("--text") + 1]
+            body = args[args.index("--markdown") + 1]  # session_turn 走 --markdown
             sent.append(body)
             return ok_envelope({"message_id": f"om_{len(sent)}"})
 
@@ -560,3 +561,48 @@ class TestAllowlistBeforeGate:
         dbmod.set_state(env.conn, "outbound_gate", "degraded:version_mismatch")
         assert env.outbound.tick() == 0
         assert job_state(env, "turn:g:0")["state"] == "pending"
+
+
+class TestWireFlagsByKind:
+    """出站 wire flag 按 kind(2026-07-17):session_turn=--markdown(可信群前提),
+    通知=--text,审批卡=转义 interactive。"""
+
+    def test_session_turn_uses_markdown_not_text(self, env):
+        bid = env.make_binding(status="active")
+        arm_send_ok(env)
+        mk_job(env, kind="session_turn", key="turn:g:0", binding_id=bid,
+               turn_group="g", chunk_index=0, body="# 标题\n- a\n```py\nx=1\n```")
+        env.outbound.tick()
+        args, _ = env.runner.calls_matching("im", "+messages-send")[0]
+        assert "--markdown" in args and "--text" not in args
+        assert args[args.index("--markdown") + 1].startswith("# 标题")
+
+    def test_lifecycle_notice_uses_text_not_markdown(self, env):
+        bid = env.make_binding(status="active")
+        arm_send_ok(env)
+        mk_job(env, kind="lifecycle_notice", key=f"lc:{bid}:bound", binding_id=bid,
+               expected_state="active", body="✅ 已绑定")
+        env.outbound.tick()
+        args, _ = env.runner.calls_matching("im", "+messages-send")[0]
+        assert "--text" in args and "--markdown" not in args
+
+    def test_inbound_notice_uses_text_not_markdown(self, env):
+        env.conn.execute(
+            "INSERT INTO inbox(event_id,message_id,chat_id,state,ts) "
+            "VALUES('e1','om_1',?,'unbound',0)", (CHAT,))
+        arm_send_ok(env)
+        mk_job(env, kind="inbound_notice", key="notice:om_1:unbound",
+               ref_message_id="om_1", expected_state="unbound", body="⚠️ 未绑定")
+        env.outbound.tick()
+        args, _ = env.runner.calls_matching("im", "+messages-send")[0]
+        assert "--text" in args and "--markdown" not in args
+
+    def test_approval_card_stays_escaped_interactive(self, env):
+        from tests.test_approval import member_pending
+        p = member_pending(env)
+        env.runner.on_prefix(["im", "+messages-reply"],
+                             lambda a, c: ok_envelope({"message_id": "om_card"}))
+        env.outbound.tick()
+        args, _ = env.runner.calls_matching("im", "+messages-reply")[0]
+        assert args[args.index("--msg-type") + 1] == "interactive"
+        assert "--markdown" not in args and "--text" not in args  # 成员预览绝不 markdown 渲染
