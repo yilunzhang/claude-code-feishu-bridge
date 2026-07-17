@@ -130,7 +130,8 @@ cd ~/.claude/skills/feishu-bridge && python3 -m pytest tests/ -q
 - **发送结果 `unknown`**:超时/信封缺字段/瞬态错误码会同 key 自动重试一次(服务端幂等已证);二次仍 unknown 则停发并阻塞同绑定后续 turn(status 高亮),需人工看一眼群里到底发没发。
 - **错误分类 = 表驱动**:`ok:false` 按 `lib/constants.py` 的 `PERMANENT_SEND_CODES`(权限/成员关系/能力/目标不存在 → failed 不重试)/ `TRANSIENT_SEND_CODES`(频控/令牌自刷 → unknown,≤1 次重试)分类;**未知 code → unknown 留人工**。表可维护,新 code 实测后补入。
 - **审批卡片发送失败自愈**:failed 的 approval_card 由恢复工人退避重臂(总尝试 ≤5 次),之后放弃并在 status 高亮(`given_up_approval_cards`)——member 消息不再无声悬挂整个审批 TTL。
-- **指纹/版本门(fail-closed)**:daemon 启动与运行期校验 lark-cli 身份(appId/owner)与版本;身份确证不符=拒启;身份未验证/版本不符=**出站停摆**(入站照常入库),带退避重探;版本升级后跑 `doctor` 全链自检通过即自动重钉 `cli_version`。
+- **指纹/版本门(fail-closed)**:daemon 启动与运行期校验 lark-cli 身份(appId/owner)与版本;身份确证不符=拒启;身份未验证/版本不符=**出站停摆**(入站照常入库),带退避重探;版本升级后跑 `doctor` 全链自检通过即自动重钉 `cli_version`。门在 ok 态每 10 分钟(单调钟)复检,漂移在下一循环发送前关门。
+- **启动态与存活分义**:daemon 心跳(`last_loop_at`)只表"进程活着";是否"就绪"由 `startup`(probing/running/degraded/refused,带 generation)判定。`bridge bind` 只在 daemon 就绪(锁+心跳新鲜+startup∈{running,degraded}+同代)后继续——身份 mismatch 的 daemon 会 refused 退出,bind 不会留下悬空绑定。
 - **owner 附件物化失败**:静默落 `failed`(status 计数),不回群提示(member 路径有失败通知)。
 - 事件到达依赖 lark-cli event bus 的 WS 在线;网络长断期消息丢失(同上不重放)。
 

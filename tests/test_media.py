@@ -154,3 +154,20 @@ def test_materialize_transient_failure_logged(env):
                              log=logs.append) is None
     joined = "\n".join(logs)
     assert "download" in joined and "rc=1" in joined
+
+
+def test_no_resources_downloaded_logged(env):
+    """r4-4:下载 ok:true 但没有资源文件 → MediaError 前记原因。"""
+    from tests.helpers import ok_envelope
+    logs = []
+
+    def empty_dl(args, cwd):
+        import pathlib as _pl
+        (_pl.Path(cwd) / "lark-im-resources").mkdir(parents=True, exist_ok=True)
+        return ok_envelope({"messages": []})
+
+    env.runner.on(lambda a: "--download-resources" in a, empty_dl)
+    with pytest.raises(MediaError):
+        media.materialize(env.runner, env.media_root, "bind-x", "om_empty", log=logs.append)
+    joined = "\n".join(logs)
+    assert "om_empty" in joined and "no resource" in joined

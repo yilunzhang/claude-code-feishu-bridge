@@ -537,3 +537,26 @@ class TestAllowlistOutboundGate:
         env.cfg["chat_allowlist"] = [CHAT]
         arm_send_ok(env)
         assert env.outbound.tick() == 1
+
+
+class TestAllowlistBeforeGate:
+    def test_out_of_list_job_cancelled_even_when_gate_degraded(self, env):
+        """r4-3:allowlist 列外 job 无论 fingerprint 门状态都确定性 cancelled。"""
+        from lib import db as dbmod
+        bid = env.make_binding(status="active")
+        mk_job(env, binding_id=bid, key="turn:g:0", turn_group="g", chunk_index=0)
+        env.cfg["chat_allowlist"] = ["oc_other"]
+        dbmod.set_state(env.conn, "outbound_gate", "degraded:identity_unverified")
+        env.outbound.tick()
+        assert job_state(env, "turn:g:0")["state"] == "cancelled"
+        assert env.runner.calls == []
+
+    def test_in_list_job_still_blocked_by_degraded_gate(self, env):
+        """对照:列内 job 在 degraded 门下仍停摆(不 cancel,保持 pending)。"""
+        from lib import db as dbmod
+        bid = env.make_binding(status="active")
+        mk_job(env, binding_id=bid, key="turn:g:0", turn_group="g", chunk_index=0)
+        env.cfg["chat_allowlist"] = [CHAT]
+        dbmod.set_state(env.conn, "outbound_gate", "degraded:version_mismatch")
+        assert env.outbound.tick() == 0
+        assert job_state(env, "turn:g:0")["state"] == "pending"

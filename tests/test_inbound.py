@@ -304,3 +304,19 @@ class TestIoForensics:
         env.recv_event()
         joined = "\n".join(logs)
         assert "mget" in joined and "rc=1" in joined and "99991400" in joined
+
+
+class TestForensicsMissingMessage:
+    def test_mget_ok_but_no_target_message_logged(self, env):
+        """r4-4:mget ok:true 但结果里没有目标 message → 记原因(非静默 None)。"""
+        from tests.helpers import ok_envelope
+        logs = []
+        env.inbound.log = logs.append
+        env.make_binding(status="active")
+        # 返回 ok 但 messages 里是别的 id
+        env.runner.on(lambda a: a[:2] == ["im", "+messages-mget"],
+                      lambda a, c: ok_envelope({"messages": [
+                          {"message_id": "om_OTHER", "content": "x"}]}))
+        env.recv_event(message_id="om_1")
+        joined = "\n".join(logs)
+        assert "om_1" in joined and ("no target" in joined or "not found" in joined)

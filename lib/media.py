@@ -26,6 +26,15 @@ def _safe_id(x):
     return s
 
 
+def _log(log, msg):
+    if log is None:
+        return
+    try:
+        log(msg)
+    except Exception:
+        pass
+
+
 def materialize(runner, media_root, binding_id, message_id,
                 quota_bytes=None, timeout_s=constants.DOWNLOAD_TIMEOUT_S, log=None):
     if quota_bytes is None:
@@ -78,6 +87,7 @@ def materialize(runner, media_root, binding_id, message_id,
                     raise MediaError(f"media quota exceeded ({total} > {quota_bytes})")
                 found.append(src)
         if not found:
+            _log(log, f"media download {message_id}: ok but no resource files downloaded")
             raise MediaError("no resource files downloaded")
         staging = tmp / "_staged"
         staging.mkdir()
@@ -90,9 +100,11 @@ def materialize(runner, media_root, binding_id, message_id,
             os.replace(src, staging / base)  # 同卷内移动
         os.rename(staging, dest)  # 原子露出
         return _existing(dest)
-    except MediaError:
+    except MediaError as e:
+        _log(log, f"media materialize {message_id} MediaError: {e}")  # r4-4
         raise
     except OSError as e:
+        _log(log, f"media materialize {message_id} fs error: {e}")
         raise MediaError(f"fs error: {e}") from e
     finally:
         if tmp is not None:

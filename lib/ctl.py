@@ -294,18 +294,35 @@ class _FlockSingleflight:
                 self.fd = None
 
 
+def state_ready(st, now_ms):
+    """r4-1:就绪 = 心跳新鲜 ∧ startup ∈ {running,degraded} ∧ 同代 generation。
+    probing/refused 不算就绪(heartbeat 只表活着,startup 才表就绪);
+    generation 对齐防"新代心跳 + 旧代 running"误判。"""
+    from .daemon_core import parse_startup, _READY_PHASES
+    if not st or st.get("last_loop_at") is None:
+        return False
+    if (now_ms - int(st["last_loop_at"])) > HUNG_THRESHOLD_MS:
+        return False  # 心跳陈旧(回拨=负值,视为新鲜)
+    phase, sgen = parse_startup(st.get("startup"))
+    if phase not in _READY_PHASES:
+        return False
+    return sgen == (st.get("daemon_generation") or "")
+
+
 def daemon_healthy(conn, now_ms=None):
-    """listener/调用方探活:锁被持有 ∧ last_loop_at 新鲜(时钟回拨按新鲜处理)。"""
+    """listener/调用方探活:锁被持有 ∧ startup 就绪(心跳新鲜+running/degraded+同代)。"""
     if not daemon_lock_held():
         return False
     try:
-        last = db.get_state(conn, "last_loop_at")
+        st = {
+            "last_loop_at": db.get_state(conn, "last_loop_at"),
+            "startup": db.get_state(conn, "startup"),
+            "daemon_generation": db.get_state(conn, "daemon_generation"),
+        }
     except Exception:
         return False
-    if last is None:
-        return False
     now = now_ms if now_ms is not None else int(time.time() * 1000)
-    return (now - int(last)) <= HUNG_THRESHOLD_MS  # 负值(回拨)=新鲜
+    return state_ready(st, now)
 
 
 class DaemonSupervisor:
@@ -325,9 +342,8 @@ class DaemonSupervisor:
         self.singleflight = singleflight
 
     def _fresh(self, st):
-        if not st or st.get("last_loop_at") is None:
-            return False
-        return (self.now_ms() - int(st["last_loop_at"])) <= HUNG_THRESHOLD_MS
+        """r4-1:就绪判定 = state_ready(心跳新鲜 ∧ startup running/degraded ∧ 同代)。"""
+        return state_ready(st, self.now_ms())
 
     def _await_health(self):
         """并发接管者在干活:本次只等结果,零 kill 零 spawn。"""
@@ -376,16 +392,13 @@ class DaemonSupervisor:
         return self._spawn_and_wait()
 
     def _spawn_and_wait(self):
-        spawn_at = self.now_ms()
         self.spawn()
         for _ in range(int(self.wait_s / _POLL_STEP_S) + 1):
             self.sleep(_POLL_STEP_S)
-            if self.lock_held():
-                st = self.read_state()
-                # 新拉起必须以"晚于本次 spawn 的心跳"为 ready(旧残留心跳不算)
-                if st and st.get("last_loop_at") is not None \
-                        and int(st["last_loop_at"]) >= spawn_at:
-                    return "started"
+            # r4-1:就绪 = state_ready(startup 得出 running/degraded);
+            # probing 期间继续等,refused/退出 → 锁释放 → 超时 failed(bind 不会继续)
+            if self.lock_held() and self._fresh(self.read_state()):
+                return "started"
         return "failed"
 
 
@@ -397,6 +410,8 @@ def _read_daemon_state():
                 "last_loop_at": db.get_state(conn, "last_loop_at"),
                 "daemon_pid": db.get_state(conn, "daemon_pid"),
                 "daemon_proc_start": db.get_state(conn, "daemon_proc_start"),
+                "startup": db.get_state(conn, "startup"),
+                "daemon_generation": db.get_state(conn, "daemon_generation"),
             }
         finally:
             conn.close()

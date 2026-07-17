@@ -13,7 +13,8 @@ from lib import constants, db, paths, procs, util  # noqa: E402
 from lib.approval import Approval  # noqa: E402
 from lib.clock import SystemClock  # noqa: E402
 from lib.daemon_core import (ConsumerManager, DaemonCore, make_status_writer,  # noqa: E402
-                             mark_consumers_down, record_daemon_identity)
+                             mark_consumers_down, record_daemon_identity,
+                             set_startup_state)
 from lib.inbound import Inbound  # noqa: E402
 from lib.outbound import Outbound  # noqa: E402
 from lib.recovery import Recovery  # noqa: E402
@@ -47,19 +48,25 @@ def main():
     conn = db.connect(paths.db_path(), busy_timeout_ms=constants.BUSY_TIMEOUT_DAEMON_MS)
     db.init_schema(conn, paths.schema_path())
     prober = procs.SystemProber()
-    # r3-5:拿锁+身份落库后**立即**写首次心跳,再跑 gate.startup(网络,最坏 ~30s)
-    record_daemon_identity(conn, clock, prober)
+    # r3-5/r4-1:拿锁+身份落库后**立即**写首次心跳 + startup_state=probing:<gen>(gate 前)。
+    # heartbeat 只表"活着";startup_state 才表"就绪"——ensure/daemon_healthy 以后者判就绪,
+    # 消除"首心跳被当启动完成"的 bind 假成功窗(daemon 可能因 mismatch 随后退出)。
+    generation = record_daemon_identity(conn, clock, prober)
     runner = LarkRunner(cfg["profile"])
     # 修复项1:指纹/版本门 fail-closed(缺字段≠ok;unknown/版本不符 → 出站停摆+退避重探)
     gate = FingerprintGate(conn, cfg, runner, clock)
     state = gate.startup()
     if state == "mismatch":
+        set_startup_state(conn, "refused", generation)  # r4-1:refused 不算就绪
         log_line("refuse start: identity fingerprint mismatch (profile/app_id/owner)")
         db.set_state(conn, "last_error", "fingerprint mismatch — daemon refused to start")
         return 3
     if state == "degraded":
+        set_startup_state(conn, "degraded", generation)  # 就绪(出站停摆但 daemon 正常运行)
         log_line(f"degraded start: outbound gated "
                  f"({db.get_state(conn, 'outbound_gate')}); 入站照常入库,带退避重探")
+    else:
+        set_startup_state(conn, "running", generation)  # r4-1:就绪
 
     def heartbeat():
         # r2-M1②:多点心跳 —— 含网络条目处理完即 touch,长下载不会被误判挂死

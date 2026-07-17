@@ -25,6 +25,9 @@ class Outbound:
 
     def tick(self, budget=constants.OUTBOUND_BATCH):
         now = self.clock.wall_ms()
+        # r4-3:allowlist 列外 job 无论 fingerprint 门状态都确定性 cancelled(兑现 README
+        # "一律 cancelled"契约)—— 排在 degraded 早返回之前。
+        self._cancel_disallowed_jobs()
         # 修复项1:指纹/版本门 degraded → 出站停摆(入站照常入库;门由 FingerprintGate 管理)
         gate = db.get_state(self.conn, "outbound_gate", "ok") or "ok"
         if gate != "ok":
@@ -48,6 +51,16 @@ class Outbound:
                     except Exception:
                         pass
         return sends
+
+    def _cancel_disallowed_jobs(self):
+        allow = self.cfg.get("chat_allowlist")
+        if not allow:
+            return
+        placeholders = ",".join("?" for _ in allow)
+        self.conn.execute(
+            f"UPDATE outbound_jobs SET state='cancelled' "
+            f"WHERE state IN ('pending','unknown') AND chat_id NOT IN ({placeholders})",
+            tuple(allow))
 
     # ------------------------------------------------------------------
     def _prepare(self, job):

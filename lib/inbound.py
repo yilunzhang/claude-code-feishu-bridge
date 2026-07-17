@@ -228,6 +228,13 @@ class Inbound:
         for m in runner_mod.data_of(env).get("messages") or []:
             if m.get("message_id") == message_id:
                 return m
+        # r4-4:ok:true 但结果里没有目标 message(非静默 None)
+        if self.log is not None:
+            ids = [m.get("message_id") for m in runner_mod.data_of(env).get("messages") or []]
+            try:
+                self.log(f"mget {message_id}: ok but no target message not found in {ids[:5]}")
+            except Exception:
+                pass
         return None
 
     def _snapshot_of(self, row):

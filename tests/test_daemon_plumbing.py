@@ -275,10 +275,23 @@ class TestConsumerReadyObservability:
         assert dbmod.get_state(env.conn, "consumer_k2_ready") == "down"
 
     def test_record_daemon_identity_writes_first_heartbeat(self, env):
-        """r3-5:身份+首次心跳一步写全(daemon 在 gate.startup 之前调用)。"""
+        """r3-5/r4-1:身份+首心跳+startup=probing:<gen>(gate 之前;heartbeat 只表活着)。"""
         from lib.daemon_core import record_daemon_identity
-        record_daemon_identity(env.conn, env.clock, env.prober)
+        gen = record_daemon_identity(env.conn, env.clock, env.prober)
         assert dbmod.get_state(env.conn, "daemon_pid") is not None
         assert dbmod.get_state(env.conn, "daemon_started_at") is not None
         assert dbmod.get_state(env.conn, "daemon_proc_start") is not None
         assert int(dbmod.get_state(env.conn, "last_loop_at")) == env.clock.wall_ms()
+        assert dbmod.get_state(env.conn, "daemon_generation") == gen
+        assert dbmod.get_state(env.conn, "startup") == f"probing:{gen}"
+
+    def test_record_identity_resets_consumers_and_gate_transitions(self, env):
+        """r4-1/r4-2:generation 建立即置 consumers=down;set_startup_state 推进 running。"""
+        from lib.daemon_core import (record_daemon_identity, set_startup_state,
+                                     RECEIVE_KEY, CARD_KEY)
+        dbmod.set_state(env.conn, f"consumer_{RECEIVE_KEY}_ready", "ready x")  # 上一代残留
+        gen = record_daemon_identity(env.conn, env.clock, env.prober)
+        assert dbmod.get_state(env.conn, f"consumer_{RECEIVE_KEY}_ready") == "down"
+        assert dbmod.get_state(env.conn, f"consumer_{CARD_KEY}_ready") == "down"
+        set_startup_state(env.conn, "running", gen)
+        assert dbmod.get_state(env.conn, "startup") == f"running:{gen}"

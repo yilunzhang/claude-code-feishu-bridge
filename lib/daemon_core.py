@@ -256,16 +256,42 @@ def mark_consumers_down(conn, keys):
         db.set_state(conn, f"consumer_{k}_ready", "down")
 
 
+STARTUP_PHASES = ("probing", "running", "degraded", "refused")
+_READY_PHASES = ("running", "degraded")
+
+
+def parse_startup(value):
+    """'phase:gen' → (phase, gen);容错空/畸形。"""
+    if not value or ":" not in value:
+        return (value or "", "")
+    phase, gen = value.split(":", 1)
+    return (phase, gen)
+
+
+def set_startup_state(conn, phase, generation):
+    """r4-1:gate.startup 得结论后置 running/degraded/refused(同 generation)。"""
+    assert phase in STARTUP_PHASES
+    db.set_state(conn, "startup", f"{phase}:{generation}")
+
+
 def record_daemon_identity(conn, clock, prober):
-    """r3-5:拿锁+建 conn 后立即记身份并写**首次心跳**(先于 gate.startup 的网络探测),
-    消除 ensure 等 12s vs gate 最坏 ~30s 的假失败窗。"""
+    """r3-5/r4-1:拿锁+建 conn 后立即记身份、**首次心跳(仅表活着)**、
+    startup_state=probing:<gen>(gate.startup 前)。**heartbeat 与 startup_state 分义**:
+    heartbeat 只说"进程活着",startup_state 才说"是否就绪"——消除"首心跳被当启动完成"的双义。
+    r4-2:同代 generation 一建立立即把所有 consumer_*_ready 置 down(不等 mgr.start_all)。
+    返回本代 generation token。"""
     import os as _os
     from . import procs as _procs
+    gen = f"{_os.getpid()}-{clock.wall_ms()}"
     db.set_state(conn, "daemon_pid", _os.getpid())
     db.set_state(conn, "daemon_started_at", clock.wall_ms())
     ident = _procs.self_identity(prober, _os.getpid())
     db.set_state(conn, "daemon_proc_start", ident[1] if ident else "")
+    db.set_state(conn, "daemon_generation", gen)
+    db.set_state(conn, "startup", f"probing:{gen}")
     db.set_state(conn, "last_loop_at", clock.wall_ms())
+    mark_consumers_down(conn, [RECEIVE_KEY, CARD_KEY])  # r4-2:跨代即刻清 ready
+    return gen
 
 
 class DaemonCore:
