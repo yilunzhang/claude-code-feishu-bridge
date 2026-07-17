@@ -310,10 +310,21 @@ class TestSupersedeLatchMatrix:
         b_new = binding(env, new["binding_id"])
         assert b_new["status"] == "active"  # 新 listener 就绪 → 激活
 
-    def test_nonce_miss_latch_still_preserved_after_unrelated_supersede(self, hook_env):
-        """对照:nonce-miss 关不掉的闩只归 supersede 场景管,其余终止路径不动已终态行的闩。"""
+    def test_nonce_miss_failed_latch_survives_real_supersede(self, hook_env):
+        """r3-2(修假绿):真执行 supersede —— 只有 consumed tombstone 被关闩,
+        nonce-miss 的 failed 行(latch=1)必须原样保留。"""
         env = hook_env
-        res = start_bind(env)
-        stop(env, msg="没有 marker 的回复")  # nonce-miss → failed + latch=1
-        p = pb(env, res["binding_id"])
-        assert p["state"] == "failed" and p["latch_open"] == 1
+        # bind1 → nonce-miss:failed row1 latch=1,binding1 closed(bind_failed)
+        res1 = start_bind(env)
+        stop(env, msg="没有 marker 的回复")
+        p1 = pb(env, res1["binding_id"])
+        assert p1["state"] == "failed" and p1["latch_open"] == 1
+        # bind2 → starting2 存在
+        res2 = start_bind(env)
+        # bind3 → **真执行 supersede**(关闭 starting2,close_reason=bind_superseded)
+        res3 = start_bind(env)
+        b2 = binding(env, res2["binding_id"])
+        assert b2["status"] == "closed" and b2["close_reason"] == "bind_superseded"
+        # failed 行的闩不被 supersede 收窄 SQL 触碰
+        p1 = pb(env, res1["binding_id"])
+        assert p1["state"] == "failed" and p1["latch_open"] == 1

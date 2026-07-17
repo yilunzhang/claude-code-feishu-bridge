@@ -290,3 +290,17 @@ class TestExtractTextE3:
         snap = mget_snapshot("om_1", CHAT, OWNER, text="hi",
                              mentions=[bot_mention(APP_ID)])
         assert extract_text(snap) == "@TestBot hi"
+
+
+class TestIoForensics:
+    def test_mget_failure_logged(self, env):
+        """r3-6:mget 失败留原始现场(rc/stdout/stderr 截断)。"""
+        from tests.helpers import FakeRunResult
+        logs = []
+        env.inbound.log = logs.append
+        env.make_binding(status="active")
+        env.runner.on(lambda a: a[:2] == ["im", "+messages-mget"],
+                      lambda a, c: FakeRunResult(1, "", '{"ok":false,"error":{"code":99991400}}'))
+        env.recv_event()
+        joined = "\n".join(logs)
+        assert "mget" in joined and "rc=1" in joined and "99991400" in joined

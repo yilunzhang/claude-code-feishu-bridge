@@ -27,7 +27,7 @@ def _safe_id(x):
 
 
 def materialize(runner, media_root, binding_id, message_id,
-                quota_bytes=None, timeout_s=constants.DOWNLOAD_TIMEOUT_S):
+                quota_bytes=None, timeout_s=constants.DOWNLOAD_TIMEOUT_S, log=None):
     if quota_bytes is None:
         quota_bytes = constants.MEDIA_MSG_QUOTA_BYTES
     media_root = pathlib.Path(media_root)
@@ -55,6 +55,13 @@ def materialize(runner, media_root, binding_id, message_id,
             timeout_s=timeout_s, cwd=str(tmp))
         env = runner_mod.parse_envelope(res.stdout)
         if res.rc != 0 or not runner_mod.envelope_ok(env):
+            if log is not None:  # r3-6:瞬态失败留现场
+                try:
+                    log(f"media download {message_id} failed: rc={res.rc} "
+                        f"timed_out={res.timed_out} stdout={(res.stdout or '')[:300]!r} "
+                        f"stderr={(res.stderr or '')[:300]!r}")
+                except Exception:
+                    pass
             return None  # 瞬态:网络/信封失败 → 稍后重试
         # 收集(先全量校验再搬运)
         found = []

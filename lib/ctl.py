@@ -122,6 +122,12 @@ def list_chats(runner):
 
 # ---------------------------------------------------------------- bind / unbind
 def bind_prepare(conn, cfg, clock, prober, chat_id, chat_name, cwd, start_pid):
+    # r3-1②(E2 盖全):目标 chat 不在 allowlist → 直接报错,零残留
+    allow = cfg.get("chat_allowlist")
+    if allow and chat_id not in allow:
+        raise lifecycle.BindConflict(
+            "chat_not_allowed",
+            f"该群不在 config.json 的 chat_allowlist 内({chat_id});改 allowlist 或换群")
     inst = procs.find_cc_instance(prober, start_pid)
     if inst is None:
         raise lifecycle.BindConflict("no_instance", "无法定位 CC 实例(ppid 链解析失败)")

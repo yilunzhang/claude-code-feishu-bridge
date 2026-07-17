@@ -144,3 +144,13 @@ def test_symlinked_parent_inside_root_rejected(env):
     with pytest.raises(MediaError):
         media.materialize(env.runner, env.media_root, "bind-linked", "om_x")
     assert env.runner.calls == []
+
+
+def test_materialize_transient_failure_logged(env):
+    """r3-6:下载瞬态失败留原始现场。"""
+    env.runner.on(lambda a: "--download-resources" in a, lambda a, c: err_envelope(500))
+    logs = []
+    assert media.materialize(env.runner, env.media_root, "bind-log", "om_log",
+                             log=logs.append) is None
+    joined = "\n".join(logs)
+    assert "download" in joined and "rc=1" in joined

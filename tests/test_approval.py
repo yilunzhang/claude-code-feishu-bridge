@@ -257,3 +257,23 @@ class TestFailClosedValidation:
         # 携带事务内可见的正确 card id → 通过
         assert env.approval.process_event(
             cb(p, event_id="cb_2", message_id="om_card_fresh"), seam=seam) == "applied"
+
+
+class TestAllowlistGate:
+    """r3-1①:遗留 pending 来自列外群 → 回调按 invalid(裸去重,零 CAS 零 delivery)。"""
+
+    def test_out_of_list_pending_callback_invalid(self, env):
+        p = member_pending(env)  # 建于无 allowlist 时
+        env.cfg["chat_allowlist"] = ["oc_other"]  # 之后收紧 allowlist
+        r = env.approval.process_event(cb(p, event_id="cb_al"))
+        assert r == "invalid"
+        assert pending_row(env, p["pending_id"])["state"] == "pending"  # 零 CAS
+        assert env.deliveries() == []  # 零 delivery
+        assert env.conn.execute(
+            "SELECT COUNT(*) FROM callback_events WHERE event_id='cb_al'").fetchone()[0] == 1
+
+    def test_in_list_pending_callback_applies(self, env):
+        p = member_pending(env)
+        from tests.conftest import CHAT as _CHAT
+        env.cfg["chat_allowlist"] = [_CHAT]
+        assert env.approval.process_event(cb(p, event_id="cb_al2")) == "applied"

@@ -256,9 +256,29 @@ class TestConsumerReadyObservability:
     def test_status_writer_syncs_daemon_state(self, env):
         from lib.daemon_core import make_status_writer
         writer = make_status_writer(env.conn, log=lambda s: None)
+        writer("im.message.receive_v1", "spawned", "pid=1 gen=1")
+        assert dbmod.get_state(env.conn,
+                               "consumer_im.message.receive_v1_ready") == "starting"  # r3-3 跨代
         writer("im.message.receive_v1", "ready", "[event] ready")
         assert dbmod.get_state(env.conn, "consumer_im.message.receive_v1_ready").startswith("ready")
         writer("im.message.receive_v1", "exited", "restarts=1")
         assert dbmod.get_state(env.conn, "consumer_im.message.receive_v1_ready") == "down"
         assert int(dbmod.get_state(env.conn,
                                    "consumer_im.message.receive_v1_restarts", "0")) == 1
+
+    def test_mark_consumers_down_on_shutdown(self, env):
+        from lib.daemon_core import make_status_writer, mark_consumers_down
+        writer = make_status_writer(env.conn, log=lambda s: None)
+        writer("k1", "ready", "x")
+        mark_consumers_down(env.conn, ["k1", "k2"])
+        assert dbmod.get_state(env.conn, "consumer_k1_ready") == "down"
+        assert dbmod.get_state(env.conn, "consumer_k2_ready") == "down"
+
+    def test_record_daemon_identity_writes_first_heartbeat(self, env):
+        """r3-5:身份+首次心跳一步写全(daemon 在 gate.startup 之前调用)。"""
+        from lib.daemon_core import record_daemon_identity
+        record_daemon_identity(env.conn, env.clock, env.prober)
+        assert dbmod.get_state(env.conn, "daemon_pid") is not None
+        assert dbmod.get_state(env.conn, "daemon_started_at") is not None
+        assert dbmod.get_state(env.conn, "daemon_proc_start") is not None
+        assert int(dbmod.get_state(env.conn, "last_loop_at")) == env.clock.wall_ms()

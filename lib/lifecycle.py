@@ -121,11 +121,12 @@ def _terminate_in_tx(conn, binding_id, close_reason, now, new_status="closed",
         "UPDATE pending_bind SET state='expired', latch_open=0 "
         "WHERE request_id=? AND state='pending'", (binding_id,))
     if close_reason == "bind_superseded":
-        # r2-m1:supersede 场景把同实例 consumed 且 latch_open=1 的 tombstone 一并关闩,
-        # 否则新 bind 的 continuation Stop 会被旧闩误抑制而错过握手(nonce-miss 留闩语义不变)
+        # r2-m1/r3-2:supersede 场景只关同实例 **consumed** tombstone 的闩
+        # (nonce-miss 的 failed 行留闩语义不变),否则新 bind 的 continuation Stop
+        # 会被旧闩误抑制而错过握手
         conn.execute(
             "UPDATE pending_bind SET latch_open=0 "
-            "WHERE cc_pid=? AND cc_start=? AND latch_open=1",
+            "WHERE cc_pid=? AND cc_start=? AND latch_open=1 AND state='consumed'",
             (row["cc_pid"], row["cc_start"]))
 
     if notify:

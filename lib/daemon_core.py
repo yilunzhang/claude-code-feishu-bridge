@@ -233,10 +233,13 @@ class ConsumerManager:
 
 
 def make_status_writer(conn, log):
-    """r2-m2:consumer 状态 → daemon_state 同步(ready 置位/清除 + restart 计数)。"""
+    """r2-m2/r3-3:consumer 状态 → daemon_state 同步(spawn=starting,ready 置位,退出=down)。"""
     def on_status(key, status, detail):
         log(f"consumer[{key}] {status}: {detail}")
-        if status == "ready":
+        if status == "spawned":
+            db.set_state(conn, f"consumer_{key}_ready", "starting")  # r3-3:跨代不误报 ready
+            db.set_state(conn, f"consumer_{key}_last_status", f"{status} {detail}"[:200])
+        elif status == "ready":
             db.set_state(conn, f"consumer_{key}_ready", f"ready {detail}"[:200])
         elif status in ("exited", "rapid-exit-alert", "spawn-failed"):
             db.set_state(conn, f"consumer_{key}_ready", "down")
@@ -245,6 +248,24 @@ def make_status_writer(conn, log):
         else:
             db.set_state(conn, f"consumer_{key}_last_status", f"{status} {detail}"[:200])
     return on_status
+
+
+def mark_consumers_down(conn, keys):
+    """daemon 正常退出:ready 一律清为 down(r3-3)。"""
+    for k in keys:
+        db.set_state(conn, f"consumer_{k}_ready", "down")
+
+
+def record_daemon_identity(conn, clock, prober):
+    """r3-5:拿锁+建 conn 后立即记身份并写**首次心跳**(先于 gate.startup 的网络探测),
+    消除 ensure 等 12s vs gate 最坏 ~30s 的假失败窗。"""
+    import os as _os
+    from . import procs as _procs
+    db.set_state(conn, "daemon_pid", _os.getpid())
+    db.set_state(conn, "daemon_started_at", clock.wall_ms())
+    ident = _procs.self_identity(prober, _os.getpid())
+    db.set_state(conn, "daemon_proc_start", ident[1] if ident else "")
+    db.set_state(conn, "last_loop_at", clock.wall_ms())
 
 
 class DaemonCore:

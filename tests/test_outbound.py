@@ -519,3 +519,21 @@ class TestE4ShortKey:
         env.clock.tick(constants.UNKNOWN_RETRY_DELAY_MS + 1)
         env.outbound.tick()
         assert seen[0] == seen[1] == util.short_key("turn:g:0")  # S4 同键重试语义保持
+
+
+class TestAllowlistOutboundGate:
+    def test_out_of_list_job_cancelled(self, env):
+        """r3-1③:allowlist 生效且 job.chat_id 不在列 → cancelled,零外发。"""
+        bid = env.make_binding(status="active")
+        mk_job(env, binding_id=bid, key="turn:g:0", turn_group="g", chunk_index=0)
+        env.cfg["chat_allowlist"] = ["oc_other"]
+        env.outbound.tick()
+        assert job_state(env, "turn:g:0")["state"] == "cancelled"
+        assert env.runner.calls == []
+
+    def test_in_list_job_sends(self, env):
+        bid = env.make_binding(status="active")
+        mk_job(env, binding_id=bid, key="turn:g:0", turn_group="g", chunk_index=0)
+        env.cfg["chat_allowlist"] = [CHAT]
+        arm_send_ok(env)
+        assert env.outbound.tick() == 1

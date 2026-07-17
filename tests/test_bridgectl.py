@@ -147,3 +147,21 @@ class TestChatAllowlistPlumbing:
         env.cfg.pop("chat_allowlist")
         rep = ctl.status_report(env.conn, env.cfg, env.clock)
         assert "全部" in rep["chat_allowlist"]
+
+
+class TestAllowlistBindGate:
+    def test_bind_out_of_list_chat_rejected(self, env, ctl_prober):
+        env.cfg["chat_allowlist"] = ["oc_other"]
+        with pytest.raises(lifecycle.BindConflict) as ei:
+            ctl.bind_prepare(env.conn, env.cfg, env.clock, ctl_prober,
+                             chat_id=CHAT, chat_name=None, cwd=None, start_pid=ZSH_PID)
+        assert ei.value.code == "chat_not_allowed"
+        # 零残留
+        assert env.conn.execute("SELECT COUNT(*) FROM bindings").fetchone()[0] == 0
+        assert env.conn.execute("SELECT COUNT(*) FROM pending_bind").fetchone()[0] == 0
+
+    def test_bind_in_list_ok(self, env, ctl_prober):
+        env.cfg["chat_allowlist"] = [CHAT]
+        res = ctl.bind_prepare(env.conn, env.cfg, env.clock, ctl_prober,
+                               chat_id=CHAT, chat_name=None, cwd=None, start_pid=ZSH_PID)
+        assert res["binding_id"]

@@ -89,13 +89,23 @@ def sender_of(snap):
 
 
 class Inbound:
-    def __init__(self, conn, cfg, runner, clock, media_root, heartbeat=None):
+    def __init__(self, conn, cfg, runner, clock, media_root, heartbeat=None, log=None):
         self.conn = conn
         self.cfg = cfg
         self.runner = runner
         self.clock = clock
         self.media_root = media_root
         self.heartbeat = heartbeat  # r2-M1②:含网络条目处理完 touch last_loop_at
+        self.log = log              # r3-6:mget/物化失败留原始现场
+
+    def _log_io_failure(self, what, res):
+        if self.log is None:
+            return
+        try:
+            self.log(f"{what}: rc={res.rc} timed_out={res.timed_out} "
+                     f"stdout={(res.stdout or '')[:300]!r} stderr={(res.stderr or '')[:300]!r}")
+        except Exception:
+            pass
 
     def _beat(self):
         if self.heartbeat is not None:
@@ -213,6 +223,7 @@ class Inbound:
              "--no-reactions"], timeout_s=constants.MGET_TIMEOUT_S)
         env = runner_mod.parse_envelope(res.stdout)
         if res.rc != 0 or not runner_mod.envelope_ok(env):
+            self._log_io_failure(f"mget {message_id} failed", res)  # r3-6
             return None
         for m in runner_mod.data_of(env).get("messages") or []:
             if m.get("message_id") == message_id:
@@ -385,7 +396,7 @@ class Inbound:
         now = self.clock.wall_ms()
         try:
             paths = media.materialize(
-                self.runner, self.media_root, row["binding_id"], mid)
+                self.runner, self.media_root, row["binding_id"], mid, log=self.log)
         except media.MediaError:
             with db.tx(self.conn):
                 db.cas(self.conn,

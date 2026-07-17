@@ -12,7 +12,8 @@ from lib import config as configmod  # noqa: E402
 from lib import constants, db, paths, procs, util  # noqa: E402
 from lib.approval import Approval  # noqa: E402
 from lib.clock import SystemClock  # noqa: E402
-from lib.daemon_core import ConsumerManager, DaemonCore, make_status_writer  # noqa: E402
+from lib.daemon_core import (ConsumerManager, DaemonCore, make_status_writer,  # noqa: E402
+                             mark_consumers_down, record_daemon_identity)
 from lib.inbound import Inbound  # noqa: E402
 from lib.outbound import Outbound  # noqa: E402
 from lib.recovery import Recovery  # noqa: E402
@@ -45,6 +46,9 @@ def main():
     clock = SystemClock()
     conn = db.connect(paths.db_path(), busy_timeout_ms=constants.BUSY_TIMEOUT_DAEMON_MS)
     db.init_schema(conn, paths.schema_path())
+    prober = procs.SystemProber()
+    # r3-5:拿锁+身份落库后**立即**写首次心跳,再跑 gate.startup(网络,最坏 ~30s)
+    record_daemon_identity(conn, clock, prober)
     runner = LarkRunner(cfg["profile"])
     # 修复项1:指纹/版本门 fail-closed(缺字段≠ok;unknown/版本不符 → 出站停摆+退避重探)
     gate = FingerprintGate(conn, cfg, runner, clock)
@@ -57,13 +61,12 @@ def main():
         log_line(f"degraded start: outbound gated "
                  f"({db.get_state(conn, 'outbound_gate')}); 入站照常入库,带退避重探")
 
-    prober = procs.SystemProber()
-
     def heartbeat():
         # r2-M1②:多点心跳 —— 含网络条目处理完即 touch,长下载不会被误判挂死
         db.set_state(conn, "last_loop_at", clock.wall_ms())
 
-    inbound = Inbound(conn, cfg, runner, clock, paths.media_root(), heartbeat=heartbeat)
+    inbound = Inbound(conn, cfg, runner, clock, paths.media_root(),
+                      heartbeat=heartbeat, log=log_line)
     outbound = Outbound(conn, cfg, runner, clock, heartbeat=heartbeat, log=log_line)
     approval = Approval(conn, cfg, clock, inbound=inbound)
     recovery = Recovery(conn, cfg, runner, clock, inbound, prober)
@@ -82,12 +85,7 @@ def main():
     signal.signal(signal.SIGTERM, on_signal)
     signal.signal(signal.SIGINT, on_signal)
 
-    db.set_state(conn, "daemon_pid", os.getpid())
-    db.set_state(conn, "daemon_started_at", clock.wall_ms())
-    # 修复项5:记录本进程 (pid, ps lstart) 供 ensure-daemon 挂死接管做精确身份匹配
-    ident = procs.self_identity(prober, os.getpid())
-    db.set_state(conn, "daemon_proc_start", ident[1] if ident else "")
-    heartbeat()  # r2-M1③:先写首次心跳,再跑可能耗时的 startup 扫描/慢恢复
+    heartbeat()  # 进入主循环前再刷一次(身份+首心跳已在 gate.startup 之前落库)
     outbound.startup_scan()
     recovery.slow_tick()
     mgr.start_all()
@@ -100,6 +98,7 @@ def main():
     finally:
         log_line("daemon shutting down")
         mgr.shutdown()
+        mark_consumers_down(conn, list(mgr.consumers.keys()))  # r3-3:正常退出清 ready
         try:
             conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
         except Exception:

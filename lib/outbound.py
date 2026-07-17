@@ -57,6 +57,14 @@ class Outbound:
                 "SELECT * FROM outbound_jobs WHERE job_id=?", (job["job_id"],)).fetchone()
             if fresh is None or fresh["state"] not in ("pending", "unknown"):
                 return "gone"
+            # r3-1③(E2 盖全兜底):allowlist 生效且 job.chat_id 不在列 → cancelled
+            allow = self.cfg.get("chat_allowlist")
+            if allow and fresh["chat_id"] not in allow:
+                db.cas(self.conn,
+                       "UPDATE outbound_jobs SET state='cancelled' "
+                       "WHERE job_id=? AND state IN ('pending','unknown')",
+                       (fresh["job_id"],))
+                return "cancelled"
             now = self.clock.wall_ms()
             if fresh["state"] == "unknown":
                 if fresh["attempt_count"] >= constants.MAX_SEND_ATTEMPTS:

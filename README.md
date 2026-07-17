@@ -69,8 +69,9 @@
      [--chat-allowlist oc_xxx,oc_yyy]
    ```
 
-   `--chat-allowlist`(可选):逗号分隔的 chat_id 白名单,用于**灰度/测试隔离**——daemon 对
-   非列内群的事件在任何入库/回复之前直接丢弃(零副作用零痕迹)。缺省/空 = 不限制(plan 语义)。
+   `--chat-allowlist`(可选):逗号分隔的 chat_id 白名单,用于**灰度/测试隔离**——覆盖全链:
+   入站事件在任何入库/回复之前直接丢弃(零副作用零痕迹);列外群的审批回调按无效处理;
+   bind 列外群直接报错;出站兜底(列外 job 一律 cancelled)。缺省/空 = 不限制(plan 语义)。
    改动 allowlist 需编辑 `config.json` 后重启 daemon 生效;`status` 会显示当前值。
 
 ## 用法

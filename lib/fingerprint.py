@@ -77,7 +77,7 @@ class FingerprintGate:
         return "degraded", ("version_mismatch" if ver == "mismatch" else "version_unverified")
 
     def _apply(self, state, reason):
-        now = self.clock.wall_ms()
+        now = self.clock.mono_ms()  # r3-4:复检/退避调度用单调钟(墙钟回拨免疫)
         if state == "ok":
             db.set_state(self.conn, GATE_KEY, "ok")
             self._backoff = PROBE_BACKOFF_START_MS
@@ -96,7 +96,7 @@ class FingerprintGate:
         return state
 
     def tick(self):
-        now = self.clock.wall_ms()
+        now = self.clock.mono_ms()  # r3-4:单调钟
         if now < self._next_probe_at:
             return
         state, reason = self._evaluate()

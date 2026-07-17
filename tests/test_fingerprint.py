@@ -251,3 +251,16 @@ class TestVersionProbeArgv:
         r.on(lambda a: a == ["--version"], lambda a, c: FakeRunResult(0, "1.0.66\n"))
         cfg = ctl.bootstrap(r, PROFILE, SystemClock())
         assert cfg["cli_version"] == "1.0.66"
+
+
+class TestReverifyClockRewind:
+    def test_reverify_survives_wall_clock_rewind(self, env):
+        """r3-4:复检调度用单调钟 —— 墙钟回拨后漂移仍能按期关门。"""
+        from tests.test_fingerprint import TestReverify
+        mutable = {"app_id": "cli_testapp"}
+        gate, r = TestReverify()._ok_gate(env, mutable)
+        env.clock.rewind_wall(3_600_000)  # 墙钟回拨 1h
+        mutable["app_id"] = "cli_evil"
+        env.clock.mono += fingerprint.REVERIFY_INTERVAL_MS + 1  # 单调钟正常前进
+        gate.tick()
+        assert dbmod.get_state(env.conn, "outbound_gate").startswith("degraded")

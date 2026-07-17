@@ -153,6 +153,13 @@ class Approval:
             "SELECT * FROM pendings WHERE pending_id=?", (pid,)).fetchone()
         if pending is None:
             return False, None
+        # r3-1①(E2 盖全):遗留 pending 来自列外群 → invalid(裸去重,零 CAS 零 delivery)
+        allow = self.cfg.get("chat_allowlist")
+        if allow:
+            b = self.conn.execute("SELECT chat_id FROM bindings WHERE binding_id=?",
+                                  (pending["binding_id"],)).fetchone()
+            if b is None or b["chat_id"] not in allow:
+                return False, None
         try:
             same = hmac.compare_digest(str(pending["nonce"]).encode("utf-8"),
                                        nonce.encode("utf-8"))
