@@ -233,17 +233,20 @@ class TestReconcileCodeIdentity:
     reconcile_code_identity 全注入依赖,可测。"""
 
     def _fakes(self, *, held=True, recorded="rootA|1.0.0", pid=5555, pstart="s",
-               alive=True):
+               alive=True, probe_unknown=False, read_fail=False):
         from tests.helpers import FakeProber
         prober = FakeProber()
-        if alive and pid is not None:
+        if alive and pid is not None and not probe_unknown:
             prober.set(pid, 1, pstart, "python3")
+        prober.raising = probe_unknown  # probe_alive → UNKNOWN
         world = {"held": held, "kills": [], "ensures": 0}
 
         def lock_held():
             return world["held"]
 
         def read_state():
+            if read_fail:
+                return None  # read_state 失败(_read_daemon_state 异常时返回 None)
             return {"daemon_code_identity": recorded, "daemon_pid": pid,
                     "daemon_proc_start": pstart}
 
@@ -255,51 +258,82 @@ class TestReconcileCodeIdentity:
             world["ensures"] += 1
             return "started"
 
-        return world, prober, lock_held, read_state, kill
+        return world, prober, lock_held, read_state, kill, ensure
 
-    def test_match_no_restart(self):
-        world, prober, lock_held, read_state, kill = self._fakes(recorded="rootA|1.0.0")
-        r = ctl.reconcile_code_identity(
-            my_identity="rootA|1.0.0", read_state=read_state, lock_held=lock_held,
-            prober=prober, kill=kill, ensure=lambda: "started", sleep=lambda s: None)
-        assert r["restarted"] is False and r["reason"] == "match"
-        assert world["kills"] == []
+    def _run(self, world, prober, lock_held, read_state, kill, ensure,
+             my_identity="rootNEW|1.0.0", wait_s=2):
+        return ctl.reconcile_code_identity(
+            my_identity=my_identity, read_state=read_state, lock_held=lock_held,
+            prober=prober, kill=kill, ensure=ensure, sleep=lambda s: None, wait_s=wait_s)
 
-    def test_no_daemon_no_restart(self):
-        world, prober, lock_held, read_state, kill = self._fakes(held=False)
-        r = ctl.reconcile_code_identity(
-            my_identity="rootA|1.0.0", read_state=read_state, lock_held=lock_held,
-            prober=prober, kill=kill, ensure=lambda: "started", sleep=lambda s: None)
-        assert r["restarted"] is False and r["reason"] == "no-daemon"
+    def test_match_proceeds_no_restart(self):
+        f = self._fakes(recorded="rootA|1.0.0")
+        r = self._run(*f, my_identity="rootA|1.0.0")
+        assert r.get("error") is None and r["restarted"] is False and r["reason"] == "match"
+        assert f[0]["kills"] == []
 
-    def test_mismatch_restarts_old_daemon(self):
-        world, prober, lock_held, read_state, kill = self._fakes(
-            recorded="rootOLD|0.9.0", pid=5555, pstart="s", alive=True)
-        r = ctl.reconcile_code_identity(
-            my_identity="rootNEW|1.0.0", read_state=read_state, lock_held=lock_held,
-            prober=prober, kill=kill, ensure=lambda: "started", sleep=lambda s: None,
-            wait_s=2)
-        assert r["restarted"] is True and r["old"] == "rootOLD|0.9.0" and r["new"] == "rootNEW|1.0.0"
-        assert world["kills"] == [(5555, __import__("signal").SIGTERM)]  # 精确 SIGTERM
-        assert r["state"] == "started"
+    def test_no_daemon_respawns_this_version(self):
+        """锁未持有(无 daemon)→ 拉本版本新的(满足不变式),无 error。"""
+        f = self._fakes(held=False)
+        r = self._run(*f)
+        assert r.get("error") is None and r["restarted"] is True and r["reason"] == "no-daemon-respawn"
+        assert f[0]["ensures"] == 1
 
-    def test_mismatch_dead_pid_no_kill(self):
-        """记录的旧 daemon pid 已死/复用 → 不杀随机进程(与冷启动竞态同类),bind 继续。"""
-        world, prober, lock_held, read_state, kill = self._fakes(
-            recorded="rootOLD|0.9.0", pid=5555, pstart="s", alive=False)
-        r = ctl.reconcile_code_identity(
-            my_identity="rootNEW|1.0.0", read_state=read_state, lock_held=lock_held,
-            prober=prober, kill=kill, ensure=lambda: "started", sleep=lambda s: None)
-        assert r["restarted"] is False and r["reason"] == "stale-daemon-unverified"
-        assert world["kills"] == []
+    def test_mismatch_killable_restarts_then_proceeds(self):
+        f = self._fakes(recorded="rootOLD|0.9.0", pid=5555, pstart="s", alive=True)
+        r = self._run(*f)
+        assert r.get("error") is None and r["restarted"] is True
+        assert r["old"] == "rootOLD|0.9.0" and r["new"] == "rootNEW|1.0.0" and r["state"] == "started"
+        assert f[0]["kills"] == [(5555, __import__("signal").SIGTERM)]  # 精确 SIGTERM
 
-    def test_mismatch_no_recorded_pid_no_kill(self):
-        world, prober, lock_held, read_state, kill = self._fakes(
-            recorded="rootOLD|0.9.0", pid=None, pstart=None)
+    # ---- fail-closed:identity 不一致但无法安全杀 + 锁仍持有 → error,不放行 bind ----
+    def test_mismatch_dead_pid_lock_held_fails_closed(self):
+        f = self._fakes(recorded="rootOLD|0.9.0", pid=5555, pstart="s", alive=False)
+        r = self._run(*f)
+        assert "error" in r and r["reason"] == "unverified-cannot-restart"
+        assert f[0]["kills"] == [] and f[0]["ensures"] == 0
+
+    def test_mismatch_missing_start_lock_held_fails_closed(self):
+        """daemon self_identity() 失败会合法记录空 proc_start → 无法安全杀 → error。"""
+        f = self._fakes(recorded="rootOLD|0.9.0", pid=5555, pstart="")  # 空 start
+        r = self._run(*f)
+        assert "error" in r and r["reason"] == "unverified-cannot-restart"
+        assert f[0]["kills"] == [] and f[0]["ensures"] == 0
+
+    def test_mismatch_probe_unknown_lock_held_fails_closed(self):
+        """probe_alive()==UNKNOWN(探测失败)→ 不杀 → error(fail-closed)。"""
+        f = self._fakes(recorded="rootOLD|0.9.0", pid=5555, pstart="s", probe_unknown=True)
+        r = self._run(*f)
+        assert "error" in r and r["reason"] == "unverified-cannot-restart"
+        assert f[0]["kills"] == [] and f[0]["ensures"] == 0
+
+    def test_read_state_failure_lock_held_fails_closed(self):
+        """read_state 失败(recorded=None,无 pid)+ 锁持有 → 无法验证 identity → error。"""
+        f = self._fakes(read_fail=True)
+        r = self._run(*f)
+        assert "error" in r and r["reason"] == "unverified-cannot-restart"
+        assert f[0]["kills"] == [] and f[0]["ensures"] == 0
+
+    def test_unverified_but_lock_released_respawns(self):
+        """无法安全杀,但锁已释放(旧 daemon 自行退出)→ 拉本版本新的(不 error)。"""
+        world = {"held": True, "kills": [], "ensures": 0}
+        from tests.helpers import FakeProber
+        prober = FakeProber()  # pid 已死 → 无法杀
+        releases = {"n": 0}
+
+        def lock_held():
+            # 首次读(no-daemon 门)持有;第二次(can_kill 失败分支里的复检)已释放
+            releases["n"] += 1
+            return releases["n"] <= 1
+
         r = ctl.reconcile_code_identity(
-            my_identity="rootNEW|1.0.0", read_state=read_state, lock_held=lock_held,
-            prober=prober, kill=kill, ensure=lambda: "started", sleep=lambda s: None)
-        assert r["restarted"] is False and world["kills"] == []
+            my_identity="rootNEW|1.0.0",
+            read_state=lambda: {"daemon_code_identity": "rootOLD|0.9.0",
+                                "daemon_pid": 5555, "daemon_proc_start": "s"},
+            lock_held=lock_held, prober=prober, kill=lambda p, s: None,
+            ensure=lambda: (world.__setitem__("ensures", world["ensures"] + 1), "started")[1],
+            sleep=lambda s: None)
+        assert r.get("error") is None and r["restarted"] is True and r["reason"] == "respawned-daemon-gone"
 
     def test_mismatch_daemon_wont_exit_surfaces_error(self):
         """SIGTERM 后 flock 未释放(旧 daemon 不退出)→ 明确 error,不 ensure。"""
@@ -307,18 +341,14 @@ class TestReconcileCodeIdentity:
         prober = FakeProber()
         prober.set(5555, 1, "s", "python3")
         ensures = {"n": 0}
-
-        def kill(p, sig):
-            pass  # daemon 不退出:锁一直持有
-
         r = ctl.reconcile_code_identity(
             my_identity="rootNEW|1.0.0",
             read_state=lambda: {"daemon_code_identity": "rootOLD|0.9.0",
                                 "daemon_pid": 5555, "daemon_proc_start": "s"},
-            lock_held=lambda: True, prober=prober, kill=kill,
+            lock_held=lambda: True, prober=prober, kill=lambda p, s: None,  # daemon 不退出
             ensure=lambda: ensures.__setitem__("n", ensures["n"] + 1),
             sleep=lambda s: None, wait_s=1)
-        assert r["restarted"] is False and "error" in r and r["reason"] == "no-exit"
+        assert "error" in r and r["reason"] == "no-exit"
         assert ensures["n"] == 0  # 没拉新 daemon
 
 
@@ -339,3 +369,48 @@ def test_bump_drop_counter_uses_short_obs_timeout(data_dir, monkeypatch):
     hooklib._bump_drop_counter()
     assert captured["busy"] == constants.BUSY_TIMEOUT_OBS_MS
     assert constants.BUSY_TIMEOUT_OBS_MS < constants.BUSY_TIMEOUT_SESSION_END_MS
+
+
+def _load_bridgectl():
+    import importlib.util
+    root = pathlib.Path(__file__).resolve().parents[1]
+    spec = importlib.util.spec_from_file_location("bridgectl_mod", root / "bin" / "bridgectl.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+class _Args:
+    def __init__(self, chat_id, chat_name=None):
+        self.chat_id = chat_id
+        self.chat_name = chat_name
+
+
+def test_cmd_bind_fails_closed_on_reconcile_error(env, monkeypatch):
+    """fail-closed 端到端:reconcile 返回 error → cmd_bind exit 非0 且 **不建 pending_bind/bindings**。"""
+    bridgectl = _load_bridgectl()
+    monkeypatch.setattr(bridgectl.ctl, "ensure_daemon", lambda *a, **k: "running")
+    monkeypatch.setattr(
+        bridgectl.ctl, "reconcile_daemon_code_identity",
+        lambda *a, **k: {"restarted": False, "reason": "unverified-cannot-restart",
+                         "error": "检测到旧版本 daemon 但无法安全自动重启,请手动停止后重试"})
+    with pytest.raises(SystemExit) as ei:
+        bridgectl.cmd_bind(_Args(CHAT, "g"))
+    assert ei.value.code == 6  # 非0
+    # 不变式:未落任何绑定
+    assert env.conn.execute("SELECT COUNT(*) FROM pending_bind").fetchone()[0] == 0
+    assert env.conn.execute("SELECT COUNT(*) FROM bindings").fetchone()[0] == 0
+
+
+def test_cmd_bind_fails_closed_when_restart_leaves_daemon_not_ready(env, monkeypatch):
+    """重启了旧 daemon 但新 daemon 未就绪 → 也不落绑定(不变式)。"""
+    bridgectl = _load_bridgectl()
+    monkeypatch.setattr(bridgectl.ctl, "ensure_daemon", lambda *a, **k: "running")
+    monkeypatch.setattr(
+        bridgectl.ctl, "reconcile_daemon_code_identity",
+        lambda *a, **k: {"restarted": True, "reason": "restarted", "state": "in_progress"})
+    with pytest.raises(SystemExit) as ei:
+        bridgectl.cmd_bind(_Args(CHAT, "g"))
+    assert ei.value.code == 5
+    assert env.conn.execute("SELECT COUNT(*) FROM pending_bind").fetchone()[0] == 0
+    assert env.conn.execute("SELECT COUNT(*) FROM bindings").fetchone()[0] == 0

@@ -51,7 +51,7 @@ def main():
     # r3-5/r4-1:拿锁+身份落库后**立即**写首次心跳 + startup_state=probing:<gen>(gate 前)。
     # heartbeat 只表"活着";startup_state 才表"就绪"——ensure/daemon_healthy 以后者判就绪,
     # 消除"首心跳被当启动完成"的 bind 假成功窗(daemon 可能因 mismatch 随后退出)。
-    # MAJOR 3:发布本 daemon 跑的**代码身份**(pkg_root|version|git),供 CLI bind 前比对,
+    # MAJOR 3:发布本 daemon 跑的**代码身份**(pkg_root|version),供 CLI bind 前比对,
     # 检测「plugin 更新/迁移后复用跑旧代码的旧 daemon」。
     generation = record_daemon_identity(
         conn, clock, prober, code_identity=version.code_identity_str())

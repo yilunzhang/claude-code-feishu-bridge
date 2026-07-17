@@ -282,7 +282,7 @@ def record_daemon_identity(conn, clock, prober, code_identity=None):
     被 supervisor 读到半态(旧代 tuple 完整对齐)。
     heartbeat 与 startup_state 分义:heartbeat 只说"进程活着",startup_state 才说"是否就绪"。
     r5-M1:generation 用**进程内唯一 token**(uuid4;不用 pid/时间——pid 可复用、同 ms 可碰撞)。
-    MAJOR 3:同事务发布 daemon_code_identity(pkg_root|version|git),供 CLI bind 前比对,
+    MAJOR 3:同事务发布 daemon_code_identity(pkg_root|version),供 CLI bind 前比对,
     检测「更新/迁移后复用跑旧代码的旧 daemon」。返回本代 generation token。"""
     import os as _os
     from . import procs as _procs, util as _util

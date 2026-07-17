@@ -279,14 +279,14 @@ class TestConsumerReadyObservability:
         MAJOR 3:给了 code_identity 就同事务发布 daemon_code_identity(daemon→supervisor 的胶水)。"""
         from lib.daemon_core import record_daemon_identity
         gen = record_daemon_identity(env.conn, env.clock, env.prober,
-                                     code_identity="rootX|1.2.3|deadbee")
+                                     code_identity="rootX|1.2.3")
         assert dbmod.get_state(env.conn, "daemon_pid") is not None
         assert dbmod.get_state(env.conn, "daemon_started_at") is not None
         assert dbmod.get_state(env.conn, "daemon_proc_start") is not None
         assert int(dbmod.get_state(env.conn, "last_loop_at")) == env.clock.wall_ms()
         assert dbmod.get_state(env.conn, "daemon_generation") == gen
         assert dbmod.get_state(env.conn, "startup") == f"probing:{gen}"
-        assert dbmod.get_state(env.conn, "daemon_code_identity") == "rootX|1.2.3|deadbee"
+        assert dbmod.get_state(env.conn, "daemon_code_identity") == "rootX|1.2.3"
 
     def test_record_identity_resets_consumers_and_gate_transitions(self, env):
         """r4-1/r4-2:generation 建立即置 consumers=down;set_startup_state 推进 running。"""

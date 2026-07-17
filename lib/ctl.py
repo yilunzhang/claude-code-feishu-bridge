@@ -598,21 +598,37 @@ def ensure_daemon(wait_s=12, spawn=True):
 def reconcile_code_identity(*, my_identity, read_state, lock_held, prober, kill,
                             ensure, sleep, wait_s=12):
     """bind 前置**串行**检查(不在 supervisor 并发层):读 daemon_state.daemon_code_identity,
-    与本 CLI code_identity_str() 比。不一致 → SIGTERM 旧 daemon(精确 pid+start;pid 复用/已死不杀)
-    → 等 flock 释放 → 重新 ensure(拉本版本新 daemon)→ 继续。一致/无 daemon → 直接继续。
+    与本 CLI code_identity_str() 比。**fail-closed 不变式**:reconcile 成功返回(无 `error`)⟹
+    「identity 已匹配」或「本版本新 daemon 已(重新)拉起」二者之一 —— 绝不在 identity 不一致时放行
+    用旧代码 bind。cmd_bind 见 `error` → 不建 pending_bind、exit 非0。
     返回 {restarted, reason, old?, new, state?, error?}。
-    两个不同 identity 的 CLI 并发 bind 的严格串行化 = 已知限制(极罕见,不在此层处理)。"""
-    st = read_state() or {}
+    两个不同 identity 的 CLI 并发 bind 的严格串行化 = 已知限制🅒(极罕见,不在此层处理);
+    read→SIGTERM 间的 probe→kill 微小窗口不可原子消除(同上,不加复杂度)。"""
     if not lock_held():
-        return {"restarted": False, "reason": "no-daemon", "new": my_identity}
+        # 无 daemon(或刚退出)→ 拉本版本的 → identity 从此为本版本(满足不变式)
+        return {"restarted": True, "reason": "no-daemon-respawn", "new": my_identity,
+                "state": ensure()}
+    st = read_state() or {}
     recorded = st.get("daemon_code_identity")
     if recorded == my_identity:
         return {"restarted": False, "reason": "match", "new": my_identity}
+    # 不一致(含 read_state 失败使 recorded=None):尝试**安全**重启旧 daemon
     pid, pstart = st.get("daemon_pid"), st.get("daemon_proc_start")
-    if not pid or not pstart or procs.probe_alive(prober, int(pid), pstart) != procs.ALIVE:
-        # pid 复用/已死/无记录 → 不杀随机进程(与冷启动竞态同类,归已知限制);让 bind 继续
-        return {"restarted": False, "reason": "stale-daemon-unverified",
-                "old": recorded, "new": my_identity}
+    # 只在 pid+start 齐全**且**探测确定存活时才杀(缺 start / 已死 / 复用 / probe UNKNOWN 都不杀)
+    can_kill = bool(pid) and bool(pstart) \
+        and procs.probe_alive(prober, int(pid), pstart) == procs.ALIVE
+    if not can_kill:
+        # 无法安全定位/终止旧 daemon:
+        #   锁已释放(旧 daemon 自行退出)→ 拉本版本新的(满足不变式);
+        #   锁仍持有(旧代码 daemon 还在)→ **fail-closed**:返回 error,绝不放行 bind。
+        if not lock_held():
+            return {"restarted": True, "reason": "respawned-daemon-gone",
+                    "old": recorded, "new": my_identity, "state": ensure()}
+        return {"restarted": False, "reason": "unverified-cannot-restart",
+                "old": recorded, "new": my_identity,
+                "error": (f"检测到不同版本/位置的 daemon(旧:{recorded},本:{my_identity})但**无法"
+                          f"安全自动重启**(无法定位/确认其进程,不误杀)。请手动停止旧 daemon 后重试:"
+                          f"先 `... status` 看 `daemon.pid` → `kill <pid>`(见 README)。")}
     try:
         kill(int(pid), signal.SIGTERM)
     except OSError as e:
@@ -625,9 +641,8 @@ def reconcile_code_identity(*, my_identity, read_state, lock_held, prober, kill,
     else:
         return {"restarted": False, "reason": "no-exit", "old": recorded, "new": my_identity,
                 "error": "旧 daemon SIGTERM 后未退出(flock 未释放);请手动停止旧 daemon 后重试(见 README)"}
-    new_state = ensure()  # 无 daemon 了 → 拉本版本的新 daemon
     return {"restarted": True, "reason": "restarted", "old": recorded, "new": my_identity,
-            "state": new_state}
+            "state": ensure()}  # 无 daemon 了 → 拉本版本的新 daemon
 
 
 def reconcile_daemon_code_identity(wait_s=12):
