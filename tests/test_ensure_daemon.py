@@ -61,10 +61,13 @@ class World:
         self.generation = "g2"
 
     def supervisor(self, **kw):
+        # codex-final:注入分离的两个时钟源 —— now_ms=墙钟(心跳/state_ready),
+        # mono_ms=单调钟(等待 deadline)。FakeClock 的 wall/mono 可独立推进。
         return DaemonSupervisor(
             lock_held=self.lock_held, read_state=self.read_state,
             spawn=self.spawn, kill=self.kill, prober=self.prober,
-            now_ms=self.clock.wall_ms, sleep=lambda s: None, **kw)
+            now_ms=self.clock.wall_ms, mono_ms=self.clock.mono_ms,
+            sleep=lambda s: None, **kw)
 
 
 def test_not_held_spawns_and_requires_fresh_heartbeat():
@@ -391,24 +394,73 @@ def test_await_handoff_owner_gone_daemon_dead_is_failed():
 def test_await_handoff_covers_full_takeover_critical_section():
     """r7-2 核心 bug:busy waiter 上限须覆盖 owner **最坏临界区**(等旧锁释放 wait_s +
     spawn 等新代就绪 wait_s+probe_wait_s = 2*wait_s+probe_wait_s)。owner 在
-    (wait_s+probe_wait_s, 2*wait_s+probe_wait_s] 之间结束 → 新上限等到 running,旧上限会假失败。"""
+    (wait_s+probe_wait_s, 2*wait_s+probe_wait_s] 之间结束 → 新上限等到 running,旧上限会假失败。
+    codex-final:deadline 由**单调钟**驱动,故用 mono 相对时长控制 owner 结束点。"""
     clock = FakeClock()
     w = World(clock, held=True, last_loop=clock.wall_ms(),
               startup="probing:gNEW", generation="gNEW")
     sf = FakeSingleflight(available=False)
-    wait_s, probe_wait_s = 10, 5  # 旧上限 15s;新上限 25s
+    wait_s, probe_wait_s = 10, 5  # 旧上限 15s;新上限 25s(mono 时长)
     sup = w.supervisor(wait_s=wait_s, probe_wait_s=probe_wait_s)
     sup.singleflight = sf
+    start_mono = clock.mono_ms()
 
     def sleep(s):
-        clock.tick(int(s * 1000))  # 真实推进单调时间 → monotonic deadline 生效
-        if clock.wall_ms() >= 20_000:  # owner 20s 后结束(> 旧 15s,< 新 25s)
+        clock.tick(int(s * 1000))  # 墙钟+单调钟同步推进
+        if clock.mono_ms() - start_mono >= 20_000:  # owner 单调 20s 后结束(> 旧 15s,< 新 25s)
             w.startup = "running:gNEW"
             w.last_loop = clock.wall_ms()
             sf.available = True  # owner 释放 → waiter 拿锁自 ensure
 
     sup.sleep = sleep
-    assert sup.ensure() == "running"  # 新上限覆盖到 20s → 等到;旧 15s 上限会在此前假失败
+    assert sup.ensure() == "running"  # 新上限(单调 25s)覆盖到 20s → 等到;旧 15s 上限会在此前假失败
+
+
+def test_await_handoff_deadline_uses_monotonic_not_wall():
+    """codex-final(唯一真 bug 回归):deadline 用**单调钟**。墙钟疯狂前跳/回拨不得让
+    busy 等待提前结束;只有单调钟正常推进才决定超时。若 deadline 误用墙钟(now_ms),
+    第一步墙钟前跳 +10min 就会立刻超时返回 in_progress,拿不到 owner 在单调 20s 的成功。"""
+    clock = FakeClock()
+    w = World(clock, held=True, last_loop=clock.wall_ms(),
+              startup="probing:gNEW", generation="gNEW")
+    sf = FakeSingleflight(available=False)
+    wait_s, probe_wait_s = 10, 5  # 单调 deadline = 25s
+    sup = w.supervisor(wait_s=wait_s, probe_wait_s=probe_wait_s)
+    sup.singleflight = sf
+    start_mono = clock.mono_ms()
+
+    def sleep(s):
+        clock.mono += int(s * 1000)          # 单调钟正常推进(每步 +0.3s)
+        clock.wall += 10 * 60 * 1000          # 墙钟每步疯狂前跳 +10min(误用墙钟必提前超时)
+        w.last_loop = clock.wall_ms()         # 心跳跟随当前墙钟 → 始终 fresh
+        if clock.mono_ms() - start_mono >= 20_000:  # owner 单调 20s(< 25s deadline)结束
+            w.startup = "running:gNEW"
+            sf.available = True
+
+    sup.sleep = sleep
+    assert sup.ensure() == "running"  # 单调钟撑到 20s 等到;若用墙钟则第 1 步就超时 → 拿不到 running
+
+
+def test_await_handoff_wall_rewind_does_not_shorten_deadline():
+    """codex-final:墙钟**回拨**(负跳)也不得影响单调 deadline —— waiter 仍等满单调预算。"""
+    clock = FakeClock()
+    w = World(clock, held=True, last_loop=clock.wall_ms(),
+              startup="probing:gNEW", generation="gNEW")
+    sf = FakeSingleflight(available=False)
+    sup = w.supervisor(wait_s=10, probe_wait_s=5)  # 单调 25s
+    sup.singleflight = sf
+    start_mono = clock.mono_ms()
+
+    def sleep(s):
+        clock.mono += int(s * 1000)
+        clock.rewind_wall(5 * 60 * 1000)     # 墙钟每步回拨 5min
+        w.last_loop = clock.wall_ms()
+        if clock.mono_ms() - start_mono >= 18_000:  # 单调 18s owner 结束
+            w.startup = "running:gNEW"
+            sf.available = True
+
+    sup.sleep = sleep
+    assert sup.ensure() == "running"
 
 
 def test_fast_path_does_not_bypass_singleflight():

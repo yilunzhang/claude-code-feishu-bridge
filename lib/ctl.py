@@ -350,13 +350,20 @@ class DaemonSupervisor:
     ③ 拉起/等待路径以 baseline generation 拒'旧代完整对齐'假成功(M1)。"""
 
     def __init__(self, *, lock_held, read_state, spawn, kill, prober,
-                 now_ms, sleep, wait_s=12, singleflight=None, probe_wait_s=None):
+                 now_ms, sleep, wait_s=12, singleflight=None, probe_wait_s=None,
+                 mono_ms=None):
         self.lock_held = lock_held
         self.read_state = read_state
         self.spawn = spawn
         self.kill = kill
         self.prober = prober
+        # codex-final:两个时钟各司其职,别混。
+        #   now_ms = **墙钟**(wall):用于心跳新鲜度/state_ready —— last_loop_at 是 DB 持久化的
+        #     墙钟时间戳,跨进程比较必须墙钟。
+        #   mono_ms = **单调钟**(monotonic):仅用于本进程内的等待 deadline —— 墙钟前跳/回拨
+        #     不得让 caller_deadline 提前结束。
         self.now_ms = now_ms
+        self.mono_ms = mono_ms or (lambda: int(time.monotonic() * 1000))
         self.sleep = sleep
         self.wait_s = wait_s
         self.singleflight = singleflight
@@ -409,10 +416,12 @@ class DaemonSupervisor:
         到期但 transition 仍有效(有 daemon 活着在忙)→ 结构化 **in_progress**(可重试,
         **非语义 failed**;bind 靠 is_ready_result 判定,不会误当成功);无进展/死 → failed。"""
         budget_s = 2 * self.wait_s + self.probe_wait_s
-        deadline = self.now_ms() + int(budget_s * 1000)  # monotonic absolute deadline
-        max_steps = int(budget_s / _POLL_STEP_S) + 2      # fail-safe(clock 不推进的测试兜底)
+        # codex-final:deadline 用**真单调钟**(self.mono_ms),不用墙钟(now_ms)——
+        # 否则墙钟前跳/回拨会让 caller_deadline 提前结束(纯步数循环旧实现没有这个回归)。
+        deadline = self.mono_ms() + int(budget_s * 1000)  # monotonic absolute deadline
+        max_steps = int(budget_s / _POLL_STEP_S) + 2      # fail-safe(mono 不推进的测试兜底)
         steps = 0
-        while self.now_ms() < deadline and steps < max_steps:
+        while self.mono_ms() < deadline and steps < max_steps:
             if self.singleflight.try_acquire():
                 try:
                     return self._ensure_locked()  # owner 已结束 → 权威判定/接管
@@ -547,7 +556,9 @@ def ensure_daemon(wait_s=12, spawn=True):
     sup = DaemonSupervisor(
         lock_held=daemon_lock_held, read_state=_read_daemon_state,
         spawn=_spawn_daemon, kill=os.kill, prober=procs.SystemProber(),
-        now_ms=lambda: int(time.time() * 1000), sleep=time.sleep, wait_s=wait_s,
+        now_ms=lambda: int(time.time() * 1000),          # 墙钟:心跳/state_ready(DB 时间戳)
+        mono_ms=lambda: int(time.monotonic() * 1000),    # 单调钟:等待 deadline(免疫墙钟跳变)
+        sleep=time.sleep, wait_s=wait_s,
         singleflight=_FlockSingleflight(paths.ensure_lock_path()))
     return sup.ensure()
 
