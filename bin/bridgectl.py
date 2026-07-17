@@ -55,16 +55,24 @@ def cmd_preflight(args):
     }
     if not cfg:
         res["next_steps"].append(
-            "首次配置(每人一次):python3 bin/bridgectl.py bootstrap --profile <lark-cli profile 名>")
-    if not hooks["seen"]:
+            "首次配置(每人一次):python3 \"${CLAUDE_SKILL_DIR}/../../bin/bridgectl.py\" "
+            "bootstrap --profile <lark-cli profile 名>")
+    if not hooks["confirmed"]:
+        stop = hooks["stop"]
+        if not stop["seen"]:
+            why = "尚未检测到 Stop hook 心跳(全新安装 / 尚未完成一轮对话时是正常的)"
+        elif not stop["fresh"]:
+            why = f"Stop hook 心跳过旧或时间戳异常(age {stop['age_s']}s)"
+        elif not stop["current"]:
+            why = (f"Stop hook 心跳来自另一 install/版本"
+                   f"(心跳 {stop['pkg_root']}@{stop['plugin_version']} ≠ "
+                   f"当前 {hooks['current_install']['pkg_root']}@{hooks['current_install']['plugin_version']})")
+        else:
+            why = "Stop hook 未确认"
         res["next_steps"].append(
-            "尚未检测到 plugin hooks 心跳(全新安装 / 尚未完成一轮对话时是正常的)。"
-            "hooks 由 plugin 自带 —— 若刚 /plugin install 或更新了 feishu-bridge,请**重启 Claude Code** "
-            "让 hooks 生效;之后随便完成一轮对话即会记录心跳(可再跑 preflight 确认)。"
-            "**绝不需要手改 settings.json。**")
-    elif not hooks["fresh"]:
-        res["next_steps"].append(
-            f"检测到 hooks 心跳但较旧(age {hooks['age_s']}s);若近期换过 plugin 版本,重启 CC 后完成一轮对话刷新。")
+            f"{why}。hooks 由 plugin 自带 —— 若刚 /plugin install 或更新了 feishu-bridge,请**重启 "
+            "Claude Code** 让 hooks 生效;之后随便完成一轮对话即会记录心跳(可再跑 preflight 确认)。"
+            "**绝不需要手改 settings.json。**(注:心跳仅诊断提示;权威证明是握手成功 + 群内 ✅ 已绑定。)")
     foreign = ctl.foreign_stop_hooks()
     if foreign:
         res["foreign_stop_hooks"] = foreign
@@ -93,7 +101,7 @@ def cmd_bind(args):
     if not ctl.is_ready_result(state):
         if state == "in_progress":
             out({"ok": False, "retryable": True, "daemon": state,
-                 "error": "daemon 正在启动(尚未就绪),请稍候重跑 /feishu-bridge bind"}, 5)
+                 "error": "daemon 正在启动(尚未就绪),请稍候重跑 /feishu-bridge:bridge bind"}, 5)
         out({"ok": False, "daemon": state, "error": "daemon 拉起失败,看 daemon.log"}, 2)
     conn = open_db()
     clock = SystemClock()
@@ -106,10 +114,12 @@ def cmd_bind(args):
     res["ok"] = True
     res["daemon"] = state
     res["hooks"] = hooks
-    if not hooks["seen"]:
-        res["hooks_note"] = ("未检测到 plugin hooks 心跳。绑定确认(握手)依赖 Stop hook —— "
-                             "若刚安装/更新 plugin,请确保**已重启 Claude Code** 让 hooks 生效。"
-                             "若约 10 分钟内群里未出现「✅ 已绑定」,说明 hooks 未生效:重启 CC 后重跑 bind。")
+    if not hooks["confirmed"]:
+        # advisory:以 Stop 心跳 seen∧fresh∧current(confirmed)为条件,不只看 seen(MAJOR 2)。
+        res["hooks_note"] = ("未确认 plugin hooks 已生效(Stop 心跳缺失/过旧/来自另一 install)。"
+                             "绑定确认(握手)依赖 Stop hook —— 若刚安装/更新 plugin,请确保**已重启 "
+                             "Claude Code** 让 hooks 生效。这是软提示;权威证明是握手成功 + 群内「✅ 已绑定」:"
+                             "若约 10 分钟内群里未出现,说明 hooks 未生效,重启 CC 后重跑 bind。")
     res["next"] = ("1) 启动 persistent Monitor 跑 listener_cmd;"
                    "2) 在给用户的回复文本里原样包含 marker 一行(触发 Stop 握手);"
                    "3) 回复里带上 banner 提醒。")

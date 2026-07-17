@@ -9,7 +9,7 @@ import sys
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
 from lib import config as configmod  # noqa: E402
-from lib import constants, db, paths, procs, util  # noqa: E402
+from lib import constants, db, paths, procs, util, version  # noqa: E402
 from lib.approval import Approval  # noqa: E402
 from lib.clock import SystemClock  # noqa: E402
 from lib.daemon_core import (ConsumerManager, DaemonCore, make_status_writer,  # noqa: E402
@@ -51,7 +51,10 @@ def main():
     # r3-5/r4-1:拿锁+身份落库后**立即**写首次心跳 + startup_state=probing:<gen>(gate 前)。
     # heartbeat 只表"活着";startup_state 才表"就绪"——ensure/daemon_healthy 以后者判就绪,
     # 消除"首心跳被当启动完成"的 bind 假成功窗(daemon 可能因 mismatch 随后退出)。
-    generation = record_daemon_identity(conn, clock, prober)
+    # MAJOR 3:发布本 daemon 跑的**代码身份**(pkg_root|version|git),供 CLI bind 前比对,
+    # 检测「plugin 更新/迁移后复用跑旧代码的旧 daemon」。
+    generation = record_daemon_identity(
+        conn, clock, prober, code_identity=version.code_identity_str())
     runner = LarkRunner(cfg["profile"])
     # 修复项1:指纹/版本门 fail-closed(缺字段≠ok;unknown/版本不符 → 出站停摆+退避重探)
     gate = FingerprintGate(conn, cfg, runner, clock)

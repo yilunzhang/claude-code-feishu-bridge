@@ -57,10 +57,12 @@ def hook_drops_path():
     return data_dir() / "hook_drops.log"
 
 
-def hook_heartbeat_path():
-    # plugin 化:Stop/SessionEnd hook 每次运行(先于任何 db/网络)写此哨兵 = "plugin hooks 已生效"
-    # 的正向信号(替代读 settings.json 判断手装 hooks)。
-    return data_dir() / "hook_heartbeat"
+def hook_heartbeat_path(event):
+    # plugin 化:Stop/SessionEnd hook 每次运行(先于任何 db/网络)写各自哨兵 =「plugin hooks 已生效」
+    # 的正向信号(替代读 settings.json 判断手装 hooks)。**Stop 与 SessionEnd 分开**(MAJOR 2):
+    # 握手依赖 Stop,故 bind 只认 Stop 心跳;SessionEnd-only 不该压掉警告。
+    assert event in ("stop", "session_end")
+    return data_dir() / f"hook_heartbeat.{event}"
 
 
 def media_root():

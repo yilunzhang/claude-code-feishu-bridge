@@ -3,6 +3,7 @@ I4 例外声明:bootstrap/chats 的读操作是 skill 交互期例外。"""
 import fcntl
 import json
 import os
+import shlex
 import subprocess
 import sys
 import time
@@ -75,19 +76,44 @@ def bootstrap(runner, profile, clock, chat_allowlist=None):
 HOOK_HEARTBEAT_FRESH_MS = 7 * 24 * 3600 * 1000  # 7 天
 
 
-def hooks_live_status(now_ms=None):
-    """返回 plugin hooks 的生效信号(哨兵心跳)。不读 settings.json、不要求手装。"""
-    p = paths.hook_heartbeat_path()
-    st = {"seen": False, "fresh": False, "age_s": None, "heartbeat_path": str(p)}
+def _read_heartbeat(event, now_ms, cur_root, cur_ver):
+    ev = {"seen": False, "fresh": False, "current": False, "age_s": None,
+          "plugin_version": None, "pkg_root": None}
     try:
-        ts = int(p.read_text().strip())
-    except (OSError, ValueError):
-        return st
+        data = json.loads(paths.hook_heartbeat_path(event).read_text())
+        ts = int(data["ts"])
+    except (OSError, ValueError, KeyError, TypeError):
+        return ev
+    age = now_ms - ts
+    ev["seen"] = True
+    ev["age_s"] = round(age / 1000, 1)
+    # fresh 要求 0<=age<=window(MAJOR 2:挡未来时间戳误判 fresh)
+    ev["fresh"] = 0 <= age <= HOOK_HEARTBEAT_FRESH_MS
+    ev["plugin_version"] = data.get("plugin_version")
+    ev["pkg_root"] = data.get("pkg_root")
+    # current = 心跳来自**本 install/版本**(MAJOR 2:另一 root/旧版本的心跳不算「我的 hooks 已生效」)
+    ev["current"] = (ev["pkg_root"] == cur_root and ev["plugin_version"] == cur_ver)
+    return ev
+
+
+def hooks_live_status(now_ms=None):
+    """plugin hooks 生效信号(哨兵心跳)。**advisory only** —— 权威证明只有「本次 Stop 握手成功
+    + 群内 ✅ 已绑定」;心跳只是软提示,不做安全判定。不读 settings.json、不要求手装。
+    Stop 与 SessionEnd 分开;记录 plugin version/pkg_root 以剔除「另一 install/旧版本/仅 SessionEnd」假阳性。
+    顶层 `confirmed` = Stop 心跳 seen ∧ fresh ∧ current(bind/preflight 的主信号)。"""
     now = now_ms if now_ms is not None else int(time.time() * 1000)
-    st["seen"] = True
-    st["age_s"] = round((now - ts) / 1000, 1)
-    st["fresh"] = (now - ts) <= HOOK_HEARTBEAT_FRESH_MS
-    return st
+    from . import version as versionmod
+    cur_root, cur_ver = versionmod.install_identity()
+    stop = _read_heartbeat("stop", now, cur_root, cur_ver)
+    se = _read_heartbeat("session_end", now, cur_root, cur_ver)
+    return {
+        "advisory": True,
+        "window_ms": HOOK_HEARTBEAT_FRESH_MS,
+        "current_install": {"pkg_root": cur_root, "plugin_version": cur_ver},
+        "stop": stop,
+        "session_end": se,
+        "confirmed": bool(stop["seen"] and stop["fresh"] and stop["current"]),
+    }
 
 
 def foreign_stop_hooks():
@@ -132,7 +158,9 @@ def bind_prepare(conn, cfg, clock, prober, chat_id, chat_name, cwd, start_pid):
     pid, lstart = inst
     res = lifecycle.create_binding(conn, chat_id=chat_id, chat_name=chat_name,
                                    cwd=cwd, cc_pid=pid, cc_start=lstart, clock=clock)
-    listener_cmd = f"python3 {paths.pkg_root() / 'bin' / 'listener.py'} {res['binding_id']}"
+    # minor①:shlex.join + sys.executable —— plugin 根/python 路径含空格也安全。
+    listener_cmd = shlex.join(
+        [sys.executable, str(paths.pkg_root() / "bin" / "listener.py"), res["binding_id"]])
     return {
         "binding_id": res["binding_id"],
         "marker": res["marker"],
@@ -349,12 +377,15 @@ class DaemonSupervisor:
 
     def __init__(self, *, lock_held, read_state, spawn, kill, prober,
                  now_ms, sleep, wait_s=12, singleflight=None, probe_wait_s=None,
-                 mono_ms=None):
+                 mono_ms=None, is_code_current=None):
         self.lock_held = lock_held
         self.read_state = read_state
         self.spawn = spawn
         self.kill = kill
         self.prober = prober
+        # MAJOR 3:is_code_current(st)->bool。健康 daemon 但跑的代码身份 != 当前 CLI → 视为需重启
+        # (SIGTERM 旧 daemon → 等退出 → 拉新的);None = 不校验(既有测试/无版本约束场景)。
+        self.is_code_current = is_code_current
         # codex-final:两个时钟各司其职,别混。
         #   now_ms = **墙钟**(wall):用于心跳新鲜度/state_ready —— last_loop_at 是 DB 持久化的
         #     墙钟时间戳,跨进程比较必须墙钟。
@@ -440,6 +471,10 @@ class DaemonSupervisor:
     def _ensure_locked(self):
         st = self.read_state()
         if self.lock_held() and self._ready(st):
+            # MAJOR 3:健康 daemon 但代码身份不符(plugin 更新/迁移后跑旧代码)→ 安全重启
+            # (SIGTERM 旧 daemon → 等退出 → 拉新的);唯一在心跳新鲜时 kill 的例外,理由=代码版本不符。
+            if self.is_code_current is not None and not self.is_code_current(st):
+                return self._takeover_and_restart(st)
             return "running"  # 稳态健康(singleflight 下无并发重启,可信)
         if self.lock_held():
             if self._heartbeat_fresh(st):
@@ -523,6 +558,7 @@ def _read_daemon_state():
                 "daemon_proc_start": db.get_state(conn, "daemon_proc_start"),
                 "startup": db.get_state(conn, "startup"),
                 "daemon_generation": db.get_state(conn, "daemon_generation"),
+                "daemon_code_identity": db.get_state(conn, "daemon_code_identity"),
             }
         finally:
             conn.close()
@@ -551,13 +587,17 @@ def ensure_daemon(wait_s=12, spawn=True):
                 conn.close()
         except Exception:
             return "down"
+    from . import version as versionmod
+    my_code = versionmod.code_identity_str()
     sup = DaemonSupervisor(
         lock_held=daemon_lock_held, read_state=_read_daemon_state,
         spawn=_spawn_daemon, kill=os.kill, prober=procs.SystemProber(),
         now_ms=lambda: int(time.time() * 1000),          # 墙钟:心跳/state_ready(DB 时间戳)
         mono_ms=lambda: int(time.monotonic() * 1000),    # 单调钟:等待 deadline(免疫墙钟跳变)
         sleep=time.sleep, wait_s=wait_s,
-        singleflight=_FlockSingleflight(paths.ensure_lock_path()))
+        singleflight=_FlockSingleflight(paths.ensure_lock_path()),
+        # MAJOR 3:健康 daemon 但 daemon_code_identity != 本 CLI → 需重启(跑旧代码的旧 daemon)。
+        is_code_current=lambda st: (st or {}).get("daemon_code_identity") == my_code)
     return sup.ensure()
 
 

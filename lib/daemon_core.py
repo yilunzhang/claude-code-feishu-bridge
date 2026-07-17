@@ -276,13 +276,14 @@ def set_startup_state(conn, phase, generation):
     db.set_state(conn, "startup", f"{phase}:{generation}")
 
 
-def record_daemon_identity(conn, clock, prober):
+def record_daemon_identity(conn, clock, prober, code_identity=None):
     """r3-5/r4-1/r5-M1:拿锁+建 conn 后**原子发布**本代身份、首次心跳(仅表活着)、
     startup=probing:<gen>、consumer down —— 同一事务,避免"拿锁到 record_identity 之间"
     被 supervisor 读到半态(旧代 tuple 完整对齐)。
     heartbeat 与 startup_state 分义:heartbeat 只说"进程活着",startup_state 才说"是否就绪"。
     r5-M1:generation 用**进程内唯一 token**(uuid4;不用 pid/时间——pid 可复用、同 ms 可碰撞)。
-    返回本代 generation token。"""
+    MAJOR 3:同事务发布 daemon_code_identity(pkg_root|version|git),供 CLI bind 前比对,
+    检测「更新/迁移后复用跑旧代码的旧 daemon」。返回本代 generation token。"""
     import os as _os
     from . import procs as _procs, util as _util
     pid = _os.getpid()
@@ -296,6 +297,8 @@ def record_daemon_identity(conn, clock, prober):
         db.set_state(conn, "daemon_generation", gen)
         db.set_state(conn, "startup", f"probing:{gen}")
         db.set_state(conn, "last_loop_at", now)
+        if code_identity is not None:
+            db.set_state(conn, "daemon_code_identity", code_identity)
         mark_consumers_down(conn, [RECEIVE_KEY, CARD_KEY])  # r4-2:跨代即刻清 ready
     return gen
 

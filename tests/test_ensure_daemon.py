@@ -15,7 +15,8 @@ class World:
     """模拟 锁/daemon_state/进程 的小世界。"""
 
     def __init__(self, clock, held=False, last_loop=None, pid=DPID, pstart=DSTART,
-                 startup="running:g1", generation="g1", linger_kill=False):
+                 startup="running:g1", generation="g1", linger_kill=False,
+                 code_identity="root|1.0.0|abc"):
         self.clock = clock
         self.held = held
         self.last_loop = last_loop
@@ -23,6 +24,7 @@ class World:
         self.pstart = pstart
         self.startup = startup
         self.generation = generation
+        self.code_identity = code_identity  # MAJOR 3:daemon 跑的代码身份
         self.kills = []
         self.spawns = 0
         self.linger_kill = linger_kill  # r6:kill 后旧代 lingering(不立即清 pid/锁)
@@ -37,7 +39,8 @@ class World:
     def read_state(self):
         return {"last_loop_at": self.last_loop, "daemon_pid": self.pid,
                 "daemon_proc_start": self.pstart, "startup": self.startup,
-                "daemon_generation": self.generation}
+                "daemon_generation": self.generation,
+                "daemon_code_identity": self.code_identity}
 
     def kill(self, pid, sig):
         self.kills.append((pid, sig))
@@ -652,3 +655,58 @@ def test_stopping_phase_not_ready(env):
         assert ctl.daemon_healthy(env.conn, now_ms=env.clock.wall_ms()) is True
     finally:
         ctlmod.daemon_lock_held = orig
+
+
+# ===== MAJOR 3: plugin 更新后复用旧 daemon 检测(代码身份) =====
+
+def test_code_identity_current_healthy_no_restart():
+    """健康 daemon 且代码身份匹配 → running,零 kill/spawn。"""
+    clock = FakeClock()
+    w = World(clock, held=True, last_loop=clock.wall_ms(),
+              startup="running:g1", generation="g1", code_identity="rootA|1.0.0|abc")
+    sup = w.supervisor(is_code_current=lambda st: st.get("daemon_code_identity") == "rootA|1.0.0|abc")
+    assert sup.ensure() == "running"
+    assert w.kills == [] and w.spawns == 0
+
+
+def test_code_identity_mismatch_restarts_stale_daemon():
+    """MAJOR 3 核心:健康 daemon 但代码身份不符(跑旧代码)→ 安全重启(SIGTERM+等退出+拉新)。"""
+    clock = FakeClock()
+    w = World(clock, held=True, last_loop=clock.wall_ms(),
+              startup="running:g1", generation="g1", code_identity="rootA|0.9.0|old")
+    # 当前 CLI 的代码身份 = 新版本;不匹配旧 daemon 的
+    sup = w.supervisor(is_code_current=lambda st: st.get("daemon_code_identity") == "rootA|1.0.0|new")
+    assert sup.ensure() == "recovered"        # takeover→重启
+    assert w.kills == [(DPID, signal.SIGTERM)]  # 精确身份匹配 SIGTERM 旧 daemon
+    assert w.spawns == 1                        # 拉起新 daemon
+
+
+def test_code_identity_none_never_restarts():
+    """向后兼容:未注入 is_code_current → 不校验代码身份,健康即 running。"""
+    clock = FakeClock()
+    w = World(clock, held=True, last_loop=clock.wall_ms(),
+              startup="running:g1", generation="g1", code_identity="whatever")
+    assert w.supervisor().ensure() == "running"
+    assert w.kills == []
+
+
+def test_code_identity_mismatch_but_dead_pid_no_kill():
+    """代码不符但记录的旧 daemon pid 已死(pid 复用)→ 不杀随机进程 → failed(交下次)。"""
+    clock = FakeClock()
+    w = World(clock, held=True, last_loop=clock.wall_ms(),
+              startup="running:g1", generation="g1", code_identity="rootA|0.9.0|old")
+    w.prober.remove(DPID)  # 记录的 daemon pid 已不存在(或复用)
+    sup = w.supervisor(is_code_current=lambda st: False)  # 恒不匹配
+    assert sup.ensure() == "failed"
+    assert w.kills == [] and w.spawns == 0
+
+
+def test_version_code_identity_str_reads_plugin_json():
+    """version.code_identity_str = pkg_root|plugin_version|git;稳定且含真实 version。"""
+    from lib import version, paths
+    ci = version.code_identity_str()
+    parts = ci.split("|")
+    assert len(parts) == 3
+    assert parts[0] == str(paths.pkg_root())
+    assert parts[1] == "1.0.0"  # 本 plugin.json version
+    assert version.code_identity_str() == ci  # 稳定(同一 checkout)

@@ -5,7 +5,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/stop_hook.py\"",
+            "command": "python3",
+            "args": ["${CLAUDE_PLUGIN_ROOT}/hooks/stop_hook.py"],
             "timeout": 15
           }
         ]
@@ -16,7 +17,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/session_end.py\"",
+            "command": "python3",
+            "args": ["${CLAUDE_PLUGIN_ROOT}/hooks/session_end.py"],
             "timeout": 15
           }
         ]

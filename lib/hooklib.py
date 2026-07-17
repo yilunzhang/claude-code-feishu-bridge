@@ -9,19 +9,24 @@ import time
 from . import constants, db, jobs, lifecycle, paths, procs, texts, util
 
 
-def _touch_hook_heartbeat():
-    """plugin 化:每次 hook 运行都写哨兵(先于 no-db 早退)=「plugin hooks 已生效」正向信号,
-    供 preflight/bind 检测(替代读 settings.json 判断手装 hooks)。绝不抛异常(hook 永不因此失败)。"""
+def _touch_hook_heartbeat(event):
+    """plugin 化:每次 hook 运行都写各自哨兵(先于 no-db 早退)=「plugin hooks 已生效」正向信号,
+    供 preflight/bind 检测(替代读 settings.json 判断手装 hooks)。记 event/时间/plugin version/
+    pkg_root(MAJOR 2:防「另一 install/旧版本/仅 SessionEnd」假阳性)。绝不抛异常(hook 永不因此失败)。"""
     try:
         paths.ensure_data_dir()
-        util.atomic_write(paths.hook_heartbeat_path(), str(int(time.time() * 1000)))
+        from . import version as versionmod
+        root, ver = versionmod.install_identity()
+        util.atomic_write(paths.hook_heartbeat_path(event), util.jdumps({
+            "event": event, "ts": int(time.time() * 1000),
+            "plugin_version": ver, "pkg_root": root}))
     except Exception:
         pass
 
 
 # ---------------------------------------------------------------- 入口(fail-closed 包装)
 def stop_hook_entry(payload, conn=None, prober=None, clock=None, start_pid=None):
-    _touch_hook_heartbeat()
+    _touch_hook_heartbeat("stop")
     own_conn = None
     try:
         if conn is None:
@@ -49,14 +54,16 @@ def stop_hook_entry(payload, conn=None, prober=None, clock=None, start_pid=None)
 
 
 def session_end_entry(payload, conn=None, prober=None, clock=None, start_pid=None):
-    _touch_hook_heartbeat()
+    _touch_hook_heartbeat("session_end")
     own_conn = None
     try:
         if conn is None:
             dbf = paths.db_path()
             if not dbf.exists():
                 return {"closed": [], "reason": "no-db"}
-            own_conn = db.connect(dbf, busy_timeout_ms=constants.BUSY_TIMEOUT_HOOK_MS)
+            # minor③:SessionEnd 关绑定是 **best-effort**(daemon cc_gone 兜底,非安全问题);
+            # 用更短的等锁超时 → 锁竞争时快速让路,绝不拖住 CC 退出。
+            own_conn = db.connect(dbf, busy_timeout_ms=constants.BUSY_TIMEOUT_SESSION_END_MS)
             conn = own_conn
         if prober is None:
             prober = procs.SystemProber()

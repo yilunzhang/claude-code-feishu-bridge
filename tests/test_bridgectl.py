@@ -1,5 +1,6 @@
 """bridgectl 逻辑层(lib/ctl.py):bootstrap 身份配方 / hooks 检查(只读)/ bind/unbind / doctor。"""
 import json
+import pathlib
 
 import pytest
 
@@ -45,29 +46,62 @@ class TestBootstrap:
             ctl.bootstrap(auth_status_runner(), "other", SystemClock())
 
 
+def _write_hb(event, ts, plugin_version=None, pkg_root=None):
+    """按新 schema 直接写某 event 的心跳文件(测试用)。"""
+    from lib import paths as pathsmod, util, version as versionmod
+    pathsmod.ensure_data_dir()
+    root, ver = versionmod.install_identity()
+    util.atomic_write(pathsmod.hook_heartbeat_path(event), util.jdumps({
+        "event": event, "ts": ts,
+        "plugin_version": plugin_version if plugin_version is not None else ver,
+        "pkg_root": pkg_root if pkg_root is not None else root}))
+
+
 class TestHooksLiveStatus:
-    """plugin 化:hooks 由 plugin 提供,检测靠哨兵心跳(不读 settings.json 判手装)。"""
+    """plugin 化:hooks 由 plugin 提供,检测靠**分事件**哨兵心跳(不读 settings.json 判手装)。
+    advisory only;Stop 心跳 seen∧fresh∧current = confirmed(主信号)。"""
 
     def test_not_seen_when_no_heartbeat(self, data_dir):
         from lib import paths as pathsmod
         pathsmod.ensure_data_dir()
         st = ctl.hooks_live_status()
-        assert st["seen"] is False and st["fresh"] is False and st["age_s"] is None
+        assert st["advisory"] is True and st["confirmed"] is False
+        assert st["stop"]["seen"] is False and st["session_end"]["seen"] is False
 
-    def test_seen_and_fresh_after_hook_runs(self, data_dir, clock):
+    def test_confirmed_after_real_stop_hook_runs(self, data_dir):
         from lib import hooklib, paths as pathsmod
         pathsmod.ensure_data_dir()
-        hooklib._touch_hook_heartbeat()  # 模拟 hook 运行写心跳
+        hooklib._touch_hook_heartbeat("stop")  # 模拟真实 Stop hook 运行
         st = ctl.hooks_live_status()
-        assert st["seen"] is True and st["fresh"] is True and st["age_s"] is not None
+        assert st["stop"]["seen"] and st["stop"]["fresh"] and st["stop"]["current"]
+        assert st["confirmed"] is True
 
-    def test_stale_heartbeat_not_fresh(self, data_dir):
-        from lib import paths as pathsmod, util
-        pathsmod.ensure_data_dir()
-        old_ts = 1000  # 远古时间戳
-        util.atomic_write(pathsmod.hook_heartbeat_path(), str(old_ts))
-        st = ctl.hooks_live_status(now_ms=old_ts + ctl.HOOK_HEARTBEAT_FRESH_MS + 1)
-        assert st["seen"] is True and st["fresh"] is False
+    def test_session_end_only_does_not_confirm(self, data_dir):
+        """MAJOR 2:仅 SessionEnd 心跳不该压掉警告(握手依赖 Stop)。"""
+        from lib import hooklib
+        hooklib._touch_hook_heartbeat("session_end")
+        st = ctl.hooks_live_status()
+        assert st["session_end"]["seen"] is True
+        assert st["stop"]["seen"] is False and st["confirmed"] is False
+
+    def test_stale_stop_not_fresh(self, data_dir):
+        _write_hb("stop", 1000)
+        st = ctl.hooks_live_status(now_ms=1000 + ctl.HOOK_HEARTBEAT_FRESH_MS + 1)
+        assert st["stop"]["seen"] and st["stop"]["fresh"] is False and st["confirmed"] is False
+
+    def test_future_timestamp_not_fresh(self, data_dir):
+        """MAJOR 2:未来时间戳(age<0)不判 fresh。"""
+        _write_hb("stop", 10_000)
+        st = ctl.hooks_live_status(now_ms=5_000)  # now 在心跳之前 → age=-5000
+        assert st["stop"]["seen"] and st["stop"]["fresh"] is False and st["confirmed"] is False
+
+    def test_another_install_or_version_not_current(self, data_dir):
+        """MAJOR 2:另一 install/旧版本的心跳不算 current → 不 confirm。"""
+        now = 1_000_000
+        _write_hb("stop", now, plugin_version="0.9.0", pkg_root="/other/install")
+        st = ctl.hooks_live_status(now_ms=now)
+        assert st["stop"]["seen"] and st["stop"]["fresh"]  # 新鲜
+        assert st["stop"]["current"] is False and st["confirmed"] is False
 
     def test_foreign_stop_hooks_detected(self, data_dir):
         p = paths.settings_json_path()
@@ -175,3 +209,20 @@ class TestAllowlistBindGate:
         res = ctl.bind_prepare(env.conn, env.cfg, env.clock, ctl_prober,
                                chat_id=CHAT, chat_name=None, cwd=None, start_pid=ZSH_PID)
         assert res["binding_id"]
+
+
+class TestListenerCmdShlex:
+    def test_listener_cmd_quotes_spaced_paths(self, env, ctl_prober, monkeypatch):
+        """minor①:pkg_root/python 含空格 → listener_cmd 用 shlex.join 正确加引号。"""
+        import shlex
+        from lib import paths as pathsmod
+        spaced = pathlib.Path("/tmp/my plugins/feishu-bridge")
+        monkeypatch.setattr(pathsmod, "pkg_root", lambda: spaced)
+        res = ctl.bind_prepare(env.conn, env.cfg, env.clock, ctl_prober,
+                               chat_id=CHAT, chat_name="g", cwd="/tmp/p", start_pid=ZSH_PID)
+        cmd = res["listener_cmd"]
+        # shlex 可安全 round-trip 回 argv;倒数第二个 = listener.py 完整路径,末位 = binding_id
+        argv = shlex.split(cmd)
+        assert argv[-2] == str(spaced / "bin" / "listener.py")
+        assert argv[-1] == res["binding_id"]
+        assert "my plugins" in argv[-2]  # 空格保留在单一 argv 里(未被拆开)

@@ -3,7 +3,7 @@
 设计:`~/csr/knowledge/feishu-bridge-plan.md` v7(七轮 codex 对抗评审收敛)。
 定位:build-in-public 桥。本地 CC session 与飞书群一一绑定;群内 @bot 消息投递进 session 作为指令;session 每 turn 最终输出自动转发回群。只管 `chat_type=group`(DM 桥 = `feishu-chat` skill)。
 
-**打包形态 = 标准 Claude Code plugin**:plugin 根含 `.claude-plugin/plugin.json`、`skills/feishu-bridge/SKILL.md`(自动发现)、`hooks/hooks.json`(Stop/SessionEnd,自动加载),以及 `bin/ lib/ schema.sql tests/`。安装 plugin 即自带 hooks——**不再需要手改 `settings.json`**。
+**打包形态 = 标准 Claude Code plugin**:plugin 根含 `.claude-plugin/plugin.json`、`skills/bridge/SKILL.md`(自动发现)、`hooks/hooks.json`(Stop/SessionEnd,自动加载),以及 `bin/ lib/ schema.sql tests/`。安装 plugin 即自带 hooks——**不再需要手改 `settings.json`**。
 
 ## 架构一图流
 
@@ -38,9 +38,9 @@
 claude --plugin-dir ~/csr/feishu-bridge
 ```
 
-安装后**重启 Claude Code**(hooks 在会话启动时加载)。`hooks/hooks.json` 由 CC 自动发现,Stop/SessionEnd hook 用 `${CLAUDE_PLUGIN_ROOT}` 自定位——**无需任何手改 settings.json**。`bridgectl preflight` 会通过「hooks 心跳」确认 hooks 是否已生效(hook 每次运行写一个哨兵;见「排查」)。
+安装后**重启 Claude Code**(hooks 在会话启动时加载)。skill 的 slash 入口 = **`/feishu-bridge:bridge`**(plugin 名:skill 名)。`hooks/hooks.json` 由 CC 自动发现(exec form,`command:"python3"` + `args:["${CLAUDE_PLUGIN_ROOT}/hooks/…"]`),Stop/SessionEnd hook 自定位——**无需任何手改 settings.json**。`preflight` 通过分事件「hooks 心跳」(Stop/SessionEnd 各一个哨兵,记 event/时间/plugin 版本/pkg_root)确认 hooks 是否已生效——**advisory only**,权威证明是「握手成功 + 群内 ✅ 已绑定」。
 
-**B. 配置身份指纹**(每人一次;profile 一经选定钉死):在 CC 里跑 `/feishu-bridge` 走引导,或直接:
+**B. 配置身份指纹**(每人一次;profile 一经选定钉死):在 CC 里跑 `/feishu-bridge:bridge` 走引导,或直接:
 
 ```bash
 python3 <plugin根>/bin/bridgectl.py bootstrap --profile <lark-cli profile 名> \
@@ -54,9 +54,11 @@ python3 <plugin根>/bin/bridgectl.py bootstrap --profile <lark-cli profile 名> 
    bind 列外群直接报错;出站兜底(列外 job 一律 cancelled)。缺省/空 = 不限制(plan 语义)。
    改动 allowlist 需编辑 `config.json` 后重启 daemon 生效;`status` 会显示当前值。
 
+**C. 更新 / 迁移**(plugin 版本升级、marketplace 换安装根、或从旧 standalone 迁来):daemon 是 detached 常驻,可能仍跑**旧代码**并与新 hook/新 CLI 共用同一 `bridge.db`。处理:**更新后重启 CC**,下次 `bind` 时 CLI 会比对自己的代码身份(`pkg_root|plugin_version|git`)与 daemon 启动时记录的 `daemon_code_identity`,**不一致则自动安全重启旧 daemon**(SIGTERM→等退出→拉起新的)。想手动先停:`pkill -f feishu-bridge/bin/daemon.py`(SIGTERM),再 bind。
+
 ## 用法
 
-CC 里 `/feishu-bridge`(见 SKILL.md);或手动:
+CC 里 `/feishu-bridge:bridge`(见 SKILL.md);或手动:
 
 ```bash
 B=<plugin根>/bin/bridgectl.py   # plugin 安装目录;SKILL.md 内用 ${CLAUDE_SKILL_DIR}/../../bin 自动定位
@@ -76,7 +78,7 @@ bind 完整握手需要 CC 侧:起 persistent Monitor 跑 `bin/listener.py <bind
 - **owner(你)** 的消息直投 session(👀 表情=已排队);**其他成员**的消息先弹审批卡片,owner 点「投递」才进 session,点「忽略」丢弃。
 - image/file 会下载到本地,payload 给绝对路径;member 附件批准前不下载。
 - 未绑定群 @bot → "未绑定"提示;绑定 session 已关 → "已关闭"提示(有冷却限速)。
-- 敏感操作前 `/feishu-bridge unbind`(立即生效),事后 rebind。
+- 敏感操作前 `/feishu-bridge:bridge unbind`(立即生效),事后 rebind。
 
 ## 数据与文件
 
@@ -86,11 +88,11 @@ bind 完整握手需要 CC 侧:起 persistent Monitor 跑 `bin/listener.py <bind
 | ├ `bridge.db` | SQLite WAL,唯一持久真相(schema 见 `schema.sql`) |
 | ├ `config.json` | 指纹:profile/app_id/bot_open_id/owner_open_id/cli_version(钉死) |
 | ├ `bridge.lock` | daemon flock 单例锁 |
-| ├ `hook_heartbeat` | plugin hooks 生效哨兵(hook 每次运行写墙钟 ms;preflight 据此判 hooks 是否已加载) |
+| ├ `hook_heartbeat.stop` / `.session_end` | plugin hooks 生效哨兵(各 event 分开;记 event/墙钟 ms/plugin 版本/pkg_root;preflight/bind 据此 advisory 判 hooks 是否已加载,不做安全判定) |
 | ├ `daemon.log` / `hook_drops.log` | daemon 日志 / hook fail-closed 丢弃记录(轮转,无正文) |
 | └ `media/<binding>/<message>/` | 附件物化(原子 rename;终态消息 7 天后清理) |
 
-代码在 **plugin 根**下:`.claude-plugin/plugin.json`(清单)· `skills/feishu-bridge/SKILL.md`(自动发现)· `hooks/hooks.json`(自动加载)+ `hooks/stop_hook.py`/`session_end.py`(只写库)· `bin/daemon.py`(守护进程)· `bin/listener.py`(Monitor 内)· `bin/bridgectl.py`(CLI)· `lib/*`(核心逻辑)· `schema.sql` · `tests/`。所有 Python 自定位靠 `Path(__file__).resolve().parents[1]` = plugin 根(bin/lib/hooks 均直接位于根下)。
+代码在 **plugin 根**下:`.claude-plugin/plugin.json`(清单)· `skills/bridge/SKILL.md`(自动发现)· `hooks/hooks.json`(自动加载)+ `hooks/stop_hook.py`/`session_end.py`(只写库)· `bin/daemon.py`(守护进程)· `bin/listener.py`(Monitor 内)· `bin/bridgectl.py`(CLI)· `lib/*`(核心逻辑)· `schema.sql` · `tests/`。所有 Python 自定位靠 `Path(__file__).resolve().parents[1]` = plugin 根(bin/lib/hooks 均直接位于根下)。
 
 ## 测试
 
@@ -108,7 +110,7 @@ cd <plugin根> && python3 -m pytest tests/ -q
   - **触发条件**:多个 CC session 在 daemon **冷启动的几十秒窗口内几乎同时**首次 bind(此前没有已运行的 daemon)。
   - **后果**:其中一个 bind 可能**假成功**(显示成功但 daemon 因故未就绪)或**假失败**(显示失败但实际可重试)。
   - **影响面**:**单会话顺序 bind、或复用已起来的 daemon,均不触发**;个人使用场景罕见。
-  - **恢复**:重跑 `/feishu-bridge bind`,或 `status` 查真实状态(daemon/consumer/绑定)。
+  - **恢复**:重跑 `/feishu-bridge:bridge bind`,或 `status` 查真实状态(daemon/consumer/绑定)。
   - **不影响安全**:机械审批门、未绑定不外发、allowlist 全部不受此竞态影响。
   - 已做的**缩窗+可观测**(非根治):busy waiter 等待上限覆盖 owner 最坏临界区(2*wait_s+probe_wait_s)且到期返回结构化 `in_progress`(bind 靠 `is_ready_result` 判定,不误当成功);daemon 退出安全点写 `startup=stopping` 且退出后不再刷心跳,supervisor 由此更快判定其停摆。**未做**(by-design):fencing/desired_generation 持久化、单行状态快照重构、launchd。
 - **🅑 S6:daemon/总线离线期间群消息不重放**:daemon 停摆或 lark-cli event bus WS 断线期间,群里 @bot 的消息**会丢失且无回执**(S6 已实证不重放);靠下次 bind / listener 的 daemon 自愈行拉起后恢复,历史消息不补投。轻量应用可接受。
