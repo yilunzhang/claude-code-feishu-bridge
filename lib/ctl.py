@@ -369,33 +369,42 @@ class DaemonSupervisor:
         from .daemon_core import parse_startup
         return parse_startup((st or {}).get("startup"))[0]
 
-    def _pid_alive(self, st):
-        pid = (st or {}).get("daemon_pid")
-        pstart = (st or {}).get("daemon_proc_start")
-        if not pid or not pstart:
-            return False
-        return procs.probe_alive(self.prober, int(pid), pstart) == procs.ALIVE
-
     # ---- 入口 ----
     def ensure(self):
         # r5-M1④:健康态 fast-path 也必须经 singleflight,不越过正在进行的 ensure。
         if self.singleflight is not None:
             if not self.singleflight.try_acquire():
-                # 另一 ensure 在处理:等它的结果,以当前代为 baseline 拒旧代残留(M1)
-                return self._await_health(self._gen_of(self.read_state()))
+                # r6:singleflight busy = 另一 owner 正持锁 ensure。busy 调用者唯一正确行为
+                # = 等 owner 的 handoff 结果,绝不观察 baseline 代的 DB 状态独立判定。
+                return self._await_handoff(self._gen_of(self.read_state()))
             try:
                 return self._ensure_locked()
             finally:
                 self.singleflight.release()
         return self._ensure_locked()
 
-    def _await_health(self, baseline_gen):
-        """等并发 ensure 的结果:承认'新代就绪(gen != baseline)'或'当前代就绪且 pid 存活'
-        (后者=稳态健康,并非旧代残留;旧代残留的 pid 已死,被排除)。零 kill 零 spawn。"""
-        for _ in range(int(self.wait_s / _POLL_STEP_S) + 1):
+    def _await_handoff(self, baseline_gen):
+        """r6:纯等待-handoff 循环(彻底重写,一次同解 M1/M2 在 busy 路径的两处未适配)。
+        为什么不能观察:signal handler 只置退出标志、当前 loop 仍会跑完刷心跳、锁到 shutdown
+        才释放——所以 owner 接管旧代时,**baseline 代退出前还能刷新鲜心跳/暂持锁/pid 暂存活**,
+        任何对 baseline 代的观察量都不可信。唯一可信信号 = handoff:
+        ① 每轮先 try_acquire —— **拿到**=owner 已结束,我成为新 owner,走权威 _ensure_locked;
+        ② 没拿到 → 只认'非空且 != baseline 的新代且该新代 state_ready(running/degraded)'为成功
+           (= owner 拉起的新 daemon 就绪);baseline 代无论 pid 死活一律**不**算成功(M1 洞);
+        ③ 短 sleep 重试。
+        等待上限 = owner 最长临界区(wait_s + probe_wait_s + 拉起余量),而非孤立 12s(M2:
+        并发 waiter 面对 owner 20~30s 慢 probing 也会等到而非假失败)。"""
+        steps = int((self.wait_s + self.probe_wait_s) / _POLL_STEP_S) + 1
+        for _ in range(steps):
+            if self.singleflight.try_acquire():
+                try:
+                    return self._ensure_locked()  # owner 已结束 → 权威判定/接管
+                finally:
+                    self.singleflight.release()
             st = self.read_state()
-            if self.lock_held() and self._ready(st) \
-                    and (self._gen_of(st) != baseline_gen or self._pid_alive(st)):
+            gen = self._gen_of(st)
+            # 只认 owner 拉起的**新代**就绪;baseline 代(含旧代垂死刷心跳/pid 存活)一律不认
+            if self.lock_held() and gen and gen != baseline_gen and self._ready(st):
                 return "running"
             self.sleep(_POLL_STEP_S)
         return "failed"

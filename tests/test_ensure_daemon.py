@@ -15,7 +15,7 @@ class World:
     """模拟 锁/daemon_state/进程 的小世界。"""
 
     def __init__(self, clock, held=False, last_loop=None, pid=DPID, pstart=DSTART,
-                 startup="running:g1", generation="g1"):
+                 startup="running:g1", generation="g1", linger_kill=False):
         self.clock = clock
         self.held = held
         self.last_loop = last_loop
@@ -25,6 +25,8 @@ class World:
         self.generation = generation
         self.kills = []
         self.spawns = 0
+        self.linger_kill = linger_kill  # r6:kill 后旧代 lingering(不立即清 pid/锁)
+        self.killed = False
         self.prober = FakeProber()
         if pid is not None:
             self.prober.set(pid, 1, pstart, "python3")
@@ -39,8 +41,17 @@ class World:
 
     def kill(self, pid, sig):
         self.kills.append((pid, sig))
-        self.held = False  # SIGTERM 后 daemon 退出释放锁
+        self.killed = True
+        if self.linger_kill:
+            return  # r6 真机:SIGTERM 不立即清 pid/锁;旧代退出前 loop 还会跑完刷心跳
+        self.held = False  # 默认:SIGTERM 后 daemon 退出释放锁(既有行为)
         self.prober.remove(pid)
+
+    def finish_exit(self):
+        """r6:模拟旧代真正退出——清 pid/锁(linger_kill 场景由 timeline 显式触发)。"""
+        self.held = False
+        if self.pid is not None:
+            self.prober.remove(self.pid)
 
     def spawn(self):
         self.spawns += 1
@@ -152,17 +163,22 @@ def test_long_download_stale_200s_not_taken_over():
 
 
 def test_singleflight_busy_no_kill_no_spawn():
-    """r2-M1④:并发接管者持锁 → 本次绝不 kill/spawn,只等对方结果。"""
+    """r2-M1④/r6:并发 owner 持锁 → 本次绝不 kill/spawn,等 handoff:
+    owner 结束释放 singleflight → waiter 拿锁走权威 _ensure_locked。"""
     clock = FakeClock()
     w = World(clock, held=True, last_loop=clock.wall_ms() - HUNG_THRESHOLD_MS - 1)
     sf = FakeSingleflight(available=False)
-    sup = w.supervisor(wait_s=1)
+    sup = w.supervisor(wait_s=2)
     sup.singleflight = sf
+    steps = {"n": 0}
 
-    def healing_sleep(s):
-        w.last_loop = clock.wall_ms()  # 对方接管成功,世界变健康
+    def owner_finishing_sleep(s):
+        steps["n"] += 1
+        if steps["n"] >= 2:
+            w.last_loop = clock.wall_ms()  # owner 完成后世界健康
+            sf.available = True            # owner 释放 → waiter 可接手
 
-    sup.sleep = healing_sleep
+    sup.sleep = owner_finishing_sleep
     assert sup.ensure() == "running"
     assert w.kills == [] and w.spawns == 0
 
@@ -298,28 +314,62 @@ def test_spawn_wait_accepts_only_new_generation():
     assert w.supervisor(wait_s=2, probe_wait_s=2).ensure() == "started"
 
 
-def test_await_health_admits_current_running_pid_alive():
-    """并发 ensure 在处理时的等待路径:当前代就绪且 pid 活 → running(不因 gen==baseline 假失败)。"""
+def test_await_handoff_acquires_and_self_ensures_when_owner_releases():
+    """r6:owner 结束释放 singleflight → busy waiter 拿到锁,走权威 _ensure_locked(而非观察)。"""
     clock = FakeClock()
     w = World(clock, held=True, last_loop=clock.wall_ms() - 1000,
-              startup="running:g1", generation="g1")
-    sf = FakeSingleflight(available=False)  # 另一 ensure 持锁
+              startup="running:gCUR", generation="gCUR")
+    sf = FakeSingleflight(available=False)  # owner 持锁
     sup = w.supervisor(wait_s=2)
     sup.singleflight = sf
+    steps = {"n": 0}
+
+    def sleep(s):
+        steps["n"] += 1
+        if steps["n"] >= 2:
+            w.last_loop = clock.wall_ms()
+            sf.available = True  # owner 释放
+
+    sup.sleep = sleep
     assert sup.ensure() == "running"
-    assert w.kills == [] and w.spawns == 0
+    assert sf.acquired >= 1 and w.kills == [] and w.spawns == 0
 
 
-def test_await_health_rejects_stale_dead_pid_generation():
-    """等待路径:旧代 running 但 daemon_pid 已死 → 不认(排除旧代残留)。"""
+def test_await_handoff_never_trusts_baseline_gen_even_fresh_hb_pid_lock():
+    """r6-① 核心洞:owner 正接管旧代(SIGTERM 后旧代退出前刷新鲜心跳、pid/锁暂存活)。
+    busy waiter 对 baseline 代的任何观察量都不可信 → 绝不判 running;
+    只等到 owner 拉起的**新代** ready(或拿锁自己 ensure)。"""
+    clock = FakeClock()
+    w = World(clock, held=True, last_loop=clock.wall_ms(),
+              startup="running:gOLD", generation="gOLD")  # 旧代:新鲜心跳+pid 活+持锁
+    sf = FakeSingleflight(available=False)  # owner E1 持锁接管中
+    sup = w.supervisor(wait_s=2, probe_wait_s=3)
+    sup.singleflight = sf
+    steps = {"n": 0}
+
+    def sleep(s):
+        steps["n"] += 1
+        # 前两轮:旧代垂死持续刷新鲜心跳(baseline 代不可信,绝不能被判 running)
+        w.last_loop = clock.wall_ms()
+        if steps["n"] == 3:
+            # owner 拉起的新代就绪(仍持 singleflight,尚未 release)
+            w.startup = "running:gNEW"
+            w.generation = "gNEW"
+
+    sup.sleep = sleep
+    assert sup.ensure() == "running"        # 等到 gNEW,不是 gOLD
+    assert w.kills == [] and w.spawns == 0   # busy waiter 不 kill/spawn
+
+
+def test_await_handoff_stale_dead_pid_baseline_never_running():
+    """r6:baseline 代无论 pid 死活一律不算成功(pid 死也不 running;pid 活也不 running)。"""
     clock = FakeClock()
     w = World(clock, held=True, last_loop=clock.wall_ms(),
               startup="running:gOLD", generation="gOLD")
-    w.prober.remove(DPID)  # 旧代进程已死
-    sf = FakeSingleflight(available=False)
-    sup = w.supervisor(wait_s=1)
+    sf = FakeSingleflight(available=False)  # owner 永不释放(卡住)
+    sup = w.supervisor(wait_s=1, probe_wait_s=1)
     sup.singleflight = sf
-    assert sup.ensure() == "failed"
+    assert sup.ensure() == "failed"  # 只有 gOLD(==baseline),既不 acquire 也无新代 → 超时失败
 
 
 def test_fast_path_does_not_bypass_singleflight():
@@ -418,3 +468,65 @@ def test_probing_then_heartbeat_goes_stale_next_ensure_takes_over():
     sup.sleep = sleep
     r1 = sup.ensure()
     assert r1 == "failed" and w.kills == []  # 本次不 kill(进入时是 fresh probing)
+
+
+# ===== r6 named regressions: fake 调真 + 并发临界区上限 =====
+
+def test_takeover_tolerates_lingering_old_gen_before_exit():
+    """r6(fake 调真):SIGTERM 后旧代 lingering —— pid/锁暂活、退出前再刷一次心跳。
+    takeover 只等锁释放,不因旧代 lingering 的观察量误判;新代 ready 才 recovered。"""
+    clock = FakeClock()
+    w = World(clock, held=True, last_loop=clock.wall_ms() - HUNG_THRESHOLD_MS - 1,
+              startup="running:gOLD", generation="gOLD", linger_kill=True)
+    steps = {"n": 0}
+
+    def sleep(s):
+        steps["n"] += 1
+        if steps["n"] == 1:
+            w.last_loop = clock.wall_ms()  # 旧代垂死刷心跳(pid/锁仍活)
+        elif steps["n"] == 2:
+            w.finish_exit()                # 旧代真正退出,锁释放
+
+    def spawn():
+        w.spawns += 1                      # E1 拉起新代
+        w.held = True
+        w.pid = 7000
+        w.prober.set(7000, 1, "new-start", "python3")
+        w.pstart = "new-start"
+        w.startup = "running:gNEW"
+        w.generation = "gNEW"
+        w.last_loop = clock.wall_ms()
+
+    w.spawn = spawn
+    sup = w.supervisor(wait_s=5, probe_wait_s=2)
+    sup.sleep = sleep
+    assert sup.ensure() == "recovered"
+    assert w.kills == [(DPID, signal.SIGTERM)]  # 精确身份匹配 kill 一次
+    assert w.spawns == 1
+
+
+def test_await_handoff_waits_full_owner_critical_section_for_slow_probing():
+    """r6-②:并发 waiter + owner 慢 probing(~30 步)→ busy waiter 在 owner 临界区上限
+    (wait_s+probe_wait_s)内等到成功,而非孤立 wait_s(旧 12s)假失败。"""
+    clock = FakeClock()
+    # owner 已拉起新代且仍 probing(baseline 此刻即 = gNEW → 走 acquire-handoff 路径)
+    w = World(clock, held=True, last_loop=clock.wall_ms(),
+              startup="probing:gNEW", generation="gNEW")
+    sf = FakeSingleflight(available=False)
+    small_wait_s = 2  # 若上限仅为 wait_s(=2s→~7 步),第 30 步的结论必然假失败
+    sup = w.supervisor(wait_s=small_wait_s, probe_wait_s=40)
+    sup.singleflight = sf
+    steps = {"n": 0}
+
+    def sleep(s):
+        steps["n"] += 1
+        w.last_loop = clock.wall_ms()  # probing 中持续心跳
+        if steps["n"] >= 30:           # owner 30 步后探测结束并释放
+            w.startup = "running:gNEW"
+            sf.available = True
+
+    sup.sleep = sleep
+    # 上限 = (2+40)/0.3 ≈ 141 步 ≥ 30 → 等到;若仅 (2)/0.3 ≈ 7 步则会 30>7 假失败
+    assert sup.ensure() == "running"
+    assert w.kills == [] and w.spawns == 0
+    assert steps["n"] >= 30  # 确实等过了 wait_s-only 的上限
