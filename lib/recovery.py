@@ -88,7 +88,7 @@ class Recovery:
                     ref_pending_id=p["pending_id"], expected_state="pending",
                     body=texts.build_approval_card(
                         p["pending_id"], p["nonce"], sender,
-                        inbound_mod.extract_text(snap)),
+                        inbound_mod.extract_text(snap, self.cfg.get("app_id"))),
                     now=now)
             elif (p["card_message_id"] is None and job["state"] == "sent"
                     and job["sent_message_id"]):

@@ -39,7 +39,7 @@ class TestActivationRegate:
         assert row["state"] == "enqueued"
         d = env.deliveries(bid)
         assert len(d) == 1
-        assert json.loads(d[0]["payload_json"])["text"].endswith("早排队的指令")
+        assert json.loads(d[0]["payload_json"])["text"] == "早排队的指令"
 
     def test_member_must_go_through_approval(self, env):
         """r6-B:激活重过分流门,member 绝不绕审批。"""

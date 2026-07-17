@@ -106,8 +106,35 @@ class FakeProber:
 
 
 def mget_snapshot(message_id, chat_id, sender_id, msg_type="text", text="hi",
-                  mentions=(), sender_type="user", extra_content=None):
-    """构造 +messages-mget 的 .data.messages[] 单条(按 brief/S1 实测形状)。"""
+                  mentions=(), sender_type="user", content=None):
+    """构造 +messages-mget 的 .data.messages[] 单条 —— **真实形状**(E3 真机样例):
+    正文在顶层 `content`(lark-cli 已渲染的纯文本,mention 以 "@{name}" 内联);
+    **没有** body.content raw-API 形状。text 参数=去掉 @ 前缀的消息本体,
+    渲染 content 自动拼 "@{name} " 前缀(与真机 "@Yilun's agent e2e-2 …" 一致)。"""
+    mentions = list(mentions)
+    if content is None:
+        prefix = "".join(f"@{m.get('name', '?')} " for m in mentions)
+        if msg_type in ("text", "post"):
+            content = prefix + text
+        elif msg_type == "image":
+            content = "[图片]"
+        elif msg_type == "file":
+            content = "(文件) a.pdf"
+        else:
+            content = ""
+    return {
+        "message_id": message_id,
+        "chat_id": chat_id,
+        "msg_type": msg_type,
+        "sender": {"id": sender_id, "id_type": "open_id", "sender_type": sender_type},
+        "content": content,
+        "mentions": mentions,
+    }
+
+
+def raw_body_snapshot(message_id, chat_id, sender_id, msg_type="text", text="hi",
+                      mentions=(), sender_type="user"):
+    """旧 raw-API body.content 形状(双形状容忍的 fallback 路径专用)。"""
     if msg_type == "text":
         content = {"text": text}
     elif msg_type == "image":
@@ -118,8 +145,6 @@ def mget_snapshot(message_id, chat_id, sender_id, msg_type="text", text="hi",
         content = {"title": "t", "content": [[{"tag": "text", "text": text}]]}
     else:
         content = {}
-    if extra_content:
-        content.update(extra_content)
     return {
         "message_id": message_id,
         "chat_id": chat_id,

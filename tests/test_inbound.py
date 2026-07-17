@@ -135,7 +135,7 @@ class TestActiveGate:
     def test_owner_text_direct_delivery(self, env):
         bid = env.make_binding(status="active")
         env.arm_mget([mget_snapshot(
-            "om_1", CHAT, OWNER, text="@_user_1 修一下 bug",
+            "om_1", CHAT, OWNER, text="修一下 bug",
             mentions=[bot_mention(APP_ID)])])
         env.recv_event()
         row = env.inbox_row("om_1")
@@ -144,7 +144,8 @@ class TestActiveGate:
         assert d["state"] == "enqueued"
         payload = json.loads(d["payload_json"])
         assert payload["sender_is_owner"] is True
-        assert payload["text"] == "@TestBot 修一下 bug"  # mention key 换显示名
+        # E3 回归:payload.text == 原始群消息文本去掉 @bot 前缀
+        assert payload["text"] == "修一下 bug"
         assert payload["message_id"] == "om_1"
         rc = env.jobs("receipt_reaction")
         assert len(rc) == 1 and rc[0]["ref_delivery_seq"] == d["delivery_seq"]
@@ -168,6 +169,9 @@ class TestActiveGate:
         body = json.loads(card["body"])
         vals = body["elements"][-1]["actions"][0]["value"]
         assert vals == {"pending_id": p["pending_id"], "nonce": p["nonce"], "act": "approve"}
+        # E3 回归:审批卡预览非空(真实 mget 形状下也取到正文)
+        preview = body["elements"][1]["text"]["content"]
+        assert "帮我跑个脚本" in preview
         assert env.deliveries() == []  # 绝不直投
 
     def test_member_media_not_downloaded_before_approval(self, env):
@@ -240,3 +244,49 @@ class TestChatAllowlist:
         env.arm_mget([mget_snapshot("om_1", CHAT, OWNER, mentions=[bot_mention(APP_ID)])])
         env.recv_event()
         assert env.inbox_row("om_1") is not None
+
+
+class TestExtractTextE3:
+    """E3:真实 mget 正文在顶层 content(渲染文本);双形状容忍;剥本 bot mention。"""
+
+    def test_real_shape_strips_bot_mention_only(self):
+        from lib.inbound import extract_text
+        from tests.helpers import mget_snapshot, bot_mention, user_mention
+        snap = mget_snapshot(
+            "om_1", CHAT, OWNER, text="",
+            mentions=[bot_mention(APP_ID, name="Yilun's agent")],
+            content="@Yilun's agent e2e-2 owner 直投探针:请列出当前目录文件")
+        assert extract_text(snap, app_id=APP_ID) == "e2e-2 owner 直投探针:请列出当前目录文件"
+
+    def test_real_shape_preserves_other_mentions(self):
+        from lib.inbound import extract_text
+        from tests.helpers import mget_snapshot, bot_mention, user_mention
+        snap = mget_snapshot(
+            "om_1", CHAT, OWNER,
+            mentions=[bot_mention(APP_ID), user_mention("ou_x", key="@_user_2", name="Some One")],
+            content="@TestBot 转告 @Some One 开会")
+        assert extract_text(snap, app_id=APP_ID) == "转告 @Some One 开会"
+
+    def test_fallback_raw_body_shape_still_works(self):
+        from lib.inbound import extract_text
+        from tests.helpers import raw_body_snapshot, bot_mention
+        snap = raw_body_snapshot("om_1", CHAT, OWNER, text="@_user_1 老形状消息",
+                                 mentions=[bot_mention(APP_ID)])
+        assert extract_text(snap, app_id=APP_ID) == "老形状消息"
+
+    def test_media_rendered_content_passthrough(self):
+        from lib.inbound import extract_text
+        from tests.helpers import mget_snapshot, bot_mention
+        img = mget_snapshot("om_i", CHAT, OWNER, msg_type="image",
+                            mentions=[bot_mention(APP_ID)])
+        f = mget_snapshot("om_f", CHAT, OWNER, msg_type="file",
+                          mentions=[bot_mention(APP_ID)])
+        assert extract_text(img, app_id=APP_ID) == "[图片]"
+        assert extract_text(f, app_id=APP_ID) == "(文件) a.pdf"
+
+    def test_no_app_id_keeps_bot_mention(self):
+        from lib.inbound import extract_text
+        from tests.helpers import mget_snapshot, bot_mention
+        snap = mget_snapshot("om_1", CHAT, OWNER, text="hi",
+                             mentions=[bot_mention(APP_ID)])
+        assert extract_text(snap) == "@TestBot hi"

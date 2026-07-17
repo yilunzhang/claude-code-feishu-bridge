@@ -27,34 +27,53 @@ def is_bot_mentioned(snap, app_id):
     return False
 
 
-def extract_text(snap):
-    mtype = snap.get("msg_type")
-    try:
-        content = json.loads((snap.get("body") or {}).get("content") or "{}")
-    except ValueError:
-        content = {}
-    if mtype == "text":
-        t = content.get("text") or ""
-    elif mtype == "post":
-        parts = []
-        if content.get("title"):
-            parts.append(str(content["title"]))
-        for para in content.get("content") or []:
-            runs = [r.get("text") for r in (para or [])
-                    if isinstance(r, dict) and r.get("text")]
-            if runs:
-                parts.append("".join(runs))
-        t = "\n".join(parts)
-    elif mtype == "image":
-        t = "(图片)"
-    elif mtype == "file":
-        t = f"(文件) {content.get('file_name', '')}".strip()
+def extract_text(snap, app_id=None):
+    """正文提取(E3 真机实锤):真实 `+messages-mget` 的正文在**顶层 `content`**
+    (lark-cli 已渲染的纯文本,mention 以 "@{name}" 内联;file/image 亦为渲染文本,
+    形如 "(文件) 名字" / "[图片]")→ 优先直接采用。
+    兼容 fallback:旧 raw-API `body.content` JSON 形状(双形状容忍,与 list_chats
+    的 items|chats 同风格)。
+    app_id 给定时:剥掉指向**本 bot** 的 mention 渲染片段("@{name}"),
+    其他人的 mention 保留原样;首尾空白规整。"""
+    top = snap.get("content")
+    if isinstance(top, str) and top:
+        t = top
     else:
-        t = ""
-    for m in snap.get("mentions") or []:
-        key, name = m.get("key"), m.get("name")
-        if key:
-            t = t.replace(key, f"@{name}" if name else "@?")
+        # fallback:raw body.content JSON 形状
+        mtype = snap.get("msg_type")
+        try:
+            content = json.loads((snap.get("body") or {}).get("content") or "{}")
+        except ValueError:
+            content = {}
+        if mtype == "text":
+            t = content.get("text") or ""
+        elif mtype == "post":
+            parts = []
+            if content.get("title"):
+                parts.append(str(content["title"]))
+            for para in content.get("content") or []:
+                runs = [r.get("text") for r in (para or [])
+                        if isinstance(r, dict) and r.get("text")]
+                if runs:
+                    parts.append("".join(runs))
+            t = "\n".join(parts)
+        elif mtype == "image":
+            t = "[图片]"
+        elif mtype == "file":
+            t = f"(文件) {content.get('file_name', '')}".strip()
+        else:
+            t = ""
+        for m in snap.get("mentions") or []:
+            key, name = m.get("key"), m.get("name")
+            if key:
+                t = t.replace(key, f"@{name}" if name else "@?")
+    if app_id:
+        for m in snap.get("mentions") or []:
+            mid = m.get("id")
+            is_bot = mid == app_id or (isinstance(mid, dict) and app_id in mid.values())
+            if is_bot and m.get("name"):
+                t = t.replace(f"@{m['name']}", "")
+        t = t.strip()
     return t
 
 
@@ -300,7 +319,8 @@ class Inbound:
             binding_id=binding["binding_id"], reply_to=mid,
             idempotency_key=jobs.key_card(pending_id), ref_pending_id=pending_id,
             expected_state="pending",
-            body=texts.build_approval_card(pending_id, nonce, sender_label, extract_text(snap)),
+            body=texts.build_approval_card(pending_id, nonce, sender_label,
+                                           extract_text(snap, self.cfg.get("app_id"))),
             now=now)
         return False
 
@@ -335,7 +355,7 @@ class Inbound:
             "sender_is_owner": sender_id == self.cfg["owner_open_id"],
             "approved_by": approved_by,
             "message_type": snap.get("msg_type"),
-            "text": extract_text(snap),
+            "text": extract_text(snap, self.cfg.get("app_id")),
             "media_paths": media_paths or [],
         }
         existing = self.conn.execute(

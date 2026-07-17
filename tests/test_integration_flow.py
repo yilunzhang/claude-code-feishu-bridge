@@ -51,7 +51,7 @@ def test_full_lifecycle(env):
     assert any("已绑定" in t for t in sent_texts)  # ✅ 已绑定 通知
 
     # 4) owner @bot 指令 → 直投 → listener 打出 → 回执
-    env.arm_mget([mget_snapshot("om_owner", CHAT, OWNER, text="@_user_1 查个数",
+    env.arm_mget([mget_snapshot("om_owner", CHAT, OWNER, text="查个数",
                                 mentions=[bot_mention(APP_ID)]),
                   mget_snapshot("om_member", CHAT, MEMBER, text="member 求助",
                                 mentions=[bot_mention(APP_ID)])])
@@ -60,7 +60,7 @@ def test_full_lifecycle(env):
     listener.step()
     msg_lines = [l for l in lines if l.get("type") == "feishu_message"]
     assert len(msg_lines) == 1 and msg_lines[0]["sender_is_owner"] is True
-    assert msg_lines[0]["text"].endswith("查个数")
+    assert msg_lines[0]["text"] == "查个数"  # E3:去 @bot 前缀后的原文
     env.outbound.tick()
     assert len(env.runner.calls_matching("im", "reactions", "create")) == 1  # 👀
 
