@@ -264,9 +264,11 @@ def daemon_lock_held():
 # 修复项5:daemon 挂死恢复。锁被持有但心跳陈旧(>HUNG_THRESHOLD)= 挂死 →
 # 按记录的 (daemon_pid, daemon_proc_start) 精确匹配后 SIGTERM → 等退出 → 接管重启;
 # 身份不匹配(pid 复用/无记录)绝不杀随机进程 → failed。
-# r2-M1①:阈值 ≥300s(单次合法下载 120s+mget 30s 量级;配合多点心跳不误杀);
+# r7-3:阈值必须 ≥ 单次**最长同步网络操作**(daemon 单线程,一次媒体下载 DOWNLOAD_TIMEOUT_S=120s
+# 期间主循环阻塞、不刷心跳)+ 余量;多点心跳只在"处理完一个含网络条目后"刷,盖不住单次下载内部。
+# 从 r2 的 300s 收窄到 =DOWNLOAD_TIMEOUT_S+60s(=180s):覆盖 120s 长下载不误判,同时更贴合。
 # r2-M1④:接管全程持 singleflight flock,防两个 ensure 重叠 kill/spawn。
-HUNG_THRESHOLD_MS = 300_000
+HUNG_THRESHOLD_MS = (constants.DOWNLOAD_TIMEOUT_S + 60) * 1000  # =180_000
 _POLL_STEP_S = 0.3
 
 
@@ -294,10 +296,19 @@ class _FlockSingleflight:
                 self.fd = None
 
 
+# r7-1:ensure() 的返回值语义 —— 只有 READY_RESULTS 才代表"daemon 就绪、bind 可继续";
+# in_progress/failed/down 都不就绪(bind 只在 is_ready_result()==True 时继续,别再"排除字符串 failed")。
+READY_RESULTS = frozenset({"running", "started", "recovered"})
+
+
+def is_ready_result(result):
+    return result in READY_RESULTS
+
+
 def state_ready(st, now_ms):
-    """r4-1:就绪 = 心跳新鲜 ∧ startup ∈ {running,degraded} ∧ 同代 generation。
-    probing/refused 不算就绪(heartbeat 只表活着,startup 才表就绪);
-    generation 对齐防"新代心跳 + 旧代 running"误判。"""
+    """r4-1/r7-2:就绪 = 心跳新鲜 ∧ startup ∈ {running,degraded} ∧ 同代 generation。
+    probing/refused/**stopping** 不算就绪(heartbeat 只表活着,startup 才表就绪;
+    stopping=正在退出,天然不在 _READY_PHASES);generation 对齐防"新代心跳 + 旧代 running"误判。"""
     from .daemon_core import parse_startup, _READY_PHASES
     if not st or st.get("last_loop_at") is None:
         return False
@@ -392,10 +403,16 @@ class DaemonSupervisor:
         ② 没拿到 → 只认'非空且 != baseline 的新代且该新代 state_ready(running/degraded)'为成功
            (= owner 拉起的新 daemon 就绪);baseline 代无论 pid 死活一律**不**算成功(M1 洞);
         ③ 短 sleep 重试。
-        等待上限 = owner 最长临界区(wait_s + probe_wait_s + 拉起余量),而非孤立 12s(M2:
-        并发 waiter 面对 owner 20~30s 慢 probing 也会等到而非假失败)。"""
-        steps = int((self.wait_s + self.probe_wait_s) / _POLL_STEP_S) + 1
-        for _ in range(steps):
+        r7-2:caller_deadline **覆盖 owner 最坏临界区** = 等旧锁释放(shutdown≈wait_s)
+        + spawn 等新代就绪(startup≈wait_s+probe_wait_s) = **2*wait_s + probe_wait_s**
+        (旧 wait_s+probe_wait_s 盖不住 owner 走 takeover 时先等旧锁释放那段)。
+        到期但 transition 仍有效(有 daemon 活着在忙)→ 结构化 **in_progress**(可重试,
+        **非语义 failed**;bind 靠 is_ready_result 判定,不会误当成功);无进展/死 → failed。"""
+        budget_s = 2 * self.wait_s + self.probe_wait_s
+        deadline = self.now_ms() + int(budget_s * 1000)  # monotonic absolute deadline
+        max_steps = int(budget_s / _POLL_STEP_S) + 2      # fail-safe(clock 不推进的测试兜底)
+        steps = 0
+        while self.now_ms() < deadline and steps < max_steps:
             if self.singleflight.try_acquire():
                 try:
                     return self._ensure_locked()  # owner 已结束 → 权威判定/接管
@@ -407,6 +424,10 @@ class DaemonSupervisor:
             if self.lock_held() and gen and gen != baseline_gen and self._ready(st):
                 return "running"
             self.sleep(_POLL_STEP_S)
+            steps += 1
+        st = self.read_state()
+        if self.lock_held() and self._heartbeat_fresh(st):
+            return "in_progress"  # owner 临界区超时但 daemon 还在忙 → 可重试,不是失败
         return "failed"
 
     def _ensure_locked(self):

@@ -98,11 +98,21 @@ def main():
     mgr.start_all()
     log_line(f"daemon started pid={os.getpid()} profile={cfg['profile']}")
     try:
-        while not stop["flag"]:
+        while True:
             mgr.poll(1.0)
-            core.loop_iteration()  # 内含 gate.tick(先于出站)
+            # r7-2:退出检查提到 loop_iteration/刷心跳**之前** —— 收到 SIGTERM 后不再刷新鲜心跳,
+            # 让 supervisor 更快看到该 daemon 停摆(缩窗;非根治冷启动竞态)。
+            if stop["flag"]:
+                break
+            core.loop_iteration()  # 内含刷心跳 + gate.tick(先于出站)
             mgr.tick()
     finally:
+        # r7-2:安全点标记 stopping(finally 首步,mgr.shutdown 前)—— supervisor 由此可观测到
+        # "daemon 正在退出",且 state_ready 天然排除 stopping(缩窗+可观测,**非根治**冷启动竞态)。
+        try:
+            set_startup_state(conn, "stopping", generation)
+        except Exception:
+            pass
         log_line("daemon shutting down")
         mgr.shutdown()
         mark_consumers_down(conn, list(mgr.consumers.keys()))  # r3-3:正常退出清 ready

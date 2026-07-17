@@ -123,7 +123,15 @@ cd ~/.claude/skills/feishu-bridge && python3 -m pytest tests/ -q
 
 ## 已知限制(plan §8 + 诚实语义)
 
-- **v1 不做**:thread 出站回复(审批卡的 reply 除外)、reaction 快捷审批、消息编辑/撤回跟踪、topic 群、离线自动补投(daemon 停摆期间的消息**不重放**,S6 已证;LaunchAgent 待决 D1)、长输出转文件、卡片原地更新(晚点击无卡片刷新,结果以文本通知)、原子换绑、消费级 ACK、post 内嵌图片(只取文本)、多 profile 多桥。
+- **🅐 多 session 冷启动窗口并发 bind(by-design 已知限制,Yilun 2026-07-16 拍板接受)**:桥定位=个人轻量应用,**不上 launchd/systemd**(否则绑 macOS,分发受限),daemon 靠首次 bind 自愈拉起。
+  - **触发条件**:多个 CC session 在 daemon **冷启动的几十秒窗口内几乎同时**首次 bind(此前没有已运行的 daemon)。
+  - **后果**:其中一个 bind 可能**假成功**(显示成功但 daemon 因故未就绪)或**假失败**(显示失败但实际可重试)。
+  - **影响面**:**单会话顺序 bind、或复用已起来的 daemon,均不触发**;个人使用场景罕见。
+  - **恢复**:重跑 `/feishu-bridge bind`,或 `status` 查真实状态(daemon/consumer/绑定)。
+  - **不影响安全**:机械审批门、未绑定不外发、allowlist 全部不受此竞态影响。
+  - 已做的**缩窗+可观测**(非根治):busy waiter 等待上限覆盖 owner 最坏临界区(2*wait_s+probe_wait_s)且到期返回结构化 `in_progress`(bind 靠 `is_ready_result` 判定,不误当成功);daemon 退出安全点写 `startup=stopping` 且退出后不再刷心跳,supervisor 由此更快判定其停摆。**未做**(by-design):fencing/desired_generation 持久化、单行状态快照重构、launchd。
+- **🅑 S6:daemon/总线离线期间群消息不重放**:daemon 停摆或 lark-cli event bus WS 断线期间,群里 @bot 的消息**会丢失且无回执**(S6 已实证不重放);靠下次 bind / listener 的 daemon 自愈行拉起后恢复,历史消息不补投。轻量应用可接受。
+- **v1 不做**:thread 出站回复(审批卡的 reply 除外)、reaction 快捷审批、消息编辑/撤回跟踪、topic 群、离线自动补投(见 🅑;LaunchAgent 已决不做,见 🅐)、长输出转文件、卡片原地更新(晚点击无卡片刷新,结果以文本通知)、原子换绑、消费级 ACK、post 内嵌图片(只取文本)、多 profile 多桥。
 - **投递语义**:delivery `emitted` = 已写入 Monitor stdout 管道;到模型 = at-least-once(payload 带 message_id,session 按 id 跳重)。Monitor 可能合并连发的行。
 - **unbind 线性化**:以各 CAS 提交为线性化点;unbind 提交前已进入 `sending` 的 job / 已 `leased` 的 delivery 允许其后完成(各至多 1 件在途),此后零新增。
 - **阻断型 Stop hook 共存**:同一 turn 会触发多次 Stop。bind turn 有链闩全抑制;普通 turn 因 turn_group 无法跨 Stop 归并,存在重复转发组风险(preflight 检测+警告;S7 语义 A2 联合验收确认,声明限制不重设计)。
@@ -131,14 +139,14 @@ cd ~/.claude/skills/feishu-bridge && python3 -m pytest tests/ -q
 - **错误分类 = 表驱动**:`ok:false` 按 `lib/constants.py` 的 `PERMANENT_SEND_CODES`(权限/成员关系/能力/目标不存在 → failed 不重试)/ `TRANSIENT_SEND_CODES`(频控/令牌自刷 → unknown,≤1 次重试)分类;**未知 code → unknown 留人工**。表可维护,新 code 实测后补入。
 - **审批卡片发送失败自愈**:failed 的 approval_card 由恢复工人退避重臂(总尝试 ≤5 次),之后放弃并在 status 高亮(`given_up_approval_cards`)——member 消息不再无声悬挂整个审批 TTL。
 - **指纹/版本门(fail-closed)**:daemon 启动与运行期校验 lark-cli 身份(appId/owner)与版本;身份确证不符=拒启;身份未验证/版本不符=**出站停摆**(入站照常入库),带退避重探;版本升级后跑 `doctor` 全链自检通过即自动重钉 `cli_version`。门在 ok 态每 10 分钟(单调钟)复检,漂移在下一循环发送前关门。
-- **启动态与存活分义**:daemon 心跳(`last_loop_at`)只表"进程活着";是否"就绪"由 `startup`(probing/running/degraded/refused,带 generation)判定。`bridge bind` 只在 daemon 就绪(锁+心跳新鲜+startup∈{running,degraded}+同代)后继续——身份 mismatch 的 daemon 会 refused 退出,bind 不会留下悬空绑定。
+- **启动态与存活分义**:daemon 心跳(`last_loop_at`)只表"进程活着";是否"就绪"由 `startup`(probing/running/degraded/refused/**stopping**,带 generation)判定。`bridge bind` 只在 daemon 就绪(锁+心跳新鲜+startup∈{running,degraded}+同代)后继续——身份 mismatch 的 daemon 会 refused 退出,正常退出会先写 stopping;两者都不算就绪。**这套分义是缩窗+可观测,不根治 🅐 的冷启动窗口竞态**(该竞态已 by-design 接受)。
 - **owner 附件物化失败**:静默落 `failed`(status 计数),不回群提示(member 路径有失败通知)。
 - 事件到达依赖 lark-cli event bus 的 WS 在线;网络长断期消息丢失(同上不重放)。
 
 ## 故障排查
 
 1. `python3 $B status`:daemon `last_loop_age_s` 应 <5s;consumer 应 ready;看 `outbound_jobs.unknown/failed` 与 `counters`。
-2. daemon 不动 → `tail -50 ~/.claude/data/feishu-bridge/daemon.log`;手动 `python3 $B ensure-daemon`(锁被持有但心跳陈旧 **>300s** = 挂死——阈值远大于单次合法下载 120s,且含网络的条目处理完都会多点刷新心跳;判定挂死后按记录的 pid+启动时间精确匹配 SIGTERM 并接管重启,全程持 singleflight 锁防两个 ensure 重叠;listener 的探活同样以"锁+心跳新鲜"为准,自动触发该自愈)。`status.outbound_gate` 非 `ok` = 出站停摆(身份未验证/版本不符),看 `gate_hint`;门在 ok 状态也每 10 分钟复检一次,身份/版本漂移会在下一循环发送前自动关门。
+2. daemon 不动 → `tail -50 ~/.claude/data/feishu-bridge/daemon.log`;手动 `python3 $B ensure-daemon`(锁被持有但心跳陈旧 **>180s**(=DOWNLOAD_TIMEOUT_S 120s + 60s 余量,覆盖单次最长同步下载不误判;从早期 300s 收窄)= 挂死;含网络的条目处理完都会多点刷新心跳;判定挂死后按记录的 pid+启动时间精确匹配 SIGTERM 并接管重启,全程持 singleflight 锁防两个 ensure 重叠;listener 的探活同样以"锁+心跳新鲜+就绪"为准,自动触发该自愈)。`status.outbound_gate` 非 `ok` = 出站停摆(身份未验证/版本不符),看 `gate_hint`;门在 ok 状态也每 10 分钟复检一次,身份/版本漂移会在下一循环发送前自动关门。
 3. 转发缺失 → `hook_drops.log`(hook fail-closed 记录);确认 hooks 已装且 CC 重启过;确认绑定 active(`status`)。
 4. 群消息进不来 → bot 是否在群里、是否真的 @ 了 bot(要结构化 @,转发/引用里的假 @ 无效)、VPN/WS 是否在线(daemon.log 的 consumer 状态)。
 5. 彻底重置:unbind 全部绑定 → 杀 daemon(`pkill -f feishu-bridge/bin/daemon.py`,SIGTERM)→ 删 `~/.claude/data/feishu-bridge/`(会丢历史)→ 重新 bootstrap。

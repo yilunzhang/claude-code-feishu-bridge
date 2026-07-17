@@ -82,8 +82,12 @@ def cmd_bind(args):
         out({"ok": False, "error": "hooks 未安装:先合入片段并重启 CC(不建 pending)",
              "hooks_snippet": ctl.hooks_snippet()}, 3)
     state = ctl.ensure_daemon()
-    if state == "failed":
-        out({"ok": False, "error": "daemon 拉起失败,看 daemon.log"}, 2)
+    # r7-1:bind 只在 daemon **结构化就绪**(is_ready_result)时继续,别再靠"排除字符串 failed"。
+    if not ctl.is_ready_result(state):
+        if state == "in_progress":
+            out({"ok": False, "retryable": True, "daemon": state,
+                 "error": "daemon 正在启动(尚未就绪),请稍候重跑 /feishu-bridge bind"}, 5)
+        out({"ok": False, "daemon": state, "error": "daemon 拉起失败,看 daemon.log"}, 2)
     conn = open_db()
     clock = SystemClock()
     try:

@@ -153,11 +153,14 @@ class FakeSingleflight:
         self.released += 1
 
 
-def test_long_download_stale_200s_not_taken_over():
-    """r2-M1 回归:阈值 ≥300s —— 200s 陈旧(单次合法下载 120s 量级)不算挂死。"""
+def test_long_download_not_taken_over_under_threshold():
+    """r7-3:阈值收窄到 DOWNLOAD_TIMEOUT_S+60(=180s);单次 120s 合法下载(daemon 单线程,
+    下载期间主循环阻塞不刷心跳)仍 < 阈值 → 不误判挂死。确认阈值 ≥ 单次最长同步网络操作。"""
+    from lib import constants
     clock = FakeClock()
-    assert HUNG_THRESHOLD_MS >= 300_000
-    w = World(clock, held=True, last_loop=clock.wall_ms() - 200_000)
+    assert HUNG_THRESHOLD_MS >= constants.DOWNLOAD_TIMEOUT_S * 1000  # 覆盖最长同步下载
+    assert HUNG_THRESHOLD_MS < 300_000  # 从 r2 的 300s 收窄
+    w = World(clock, held=True, last_loop=clock.wall_ms() - constants.DOWNLOAD_TIMEOUT_S * 1000)
     assert w.supervisor().ensure() == "running"
     assert w.kills == [] and w.spawns == 0
 
@@ -361,15 +364,51 @@ def test_await_handoff_never_trusts_baseline_gen_even_fresh_hb_pid_lock():
     assert w.kills == [] and w.spawns == 0   # busy waiter 不 kill/spawn
 
 
-def test_await_handoff_stale_dead_pid_baseline_never_running():
-    """r6:baseline 代无论 pid 死活一律不算成功(pid 死也不 running;pid 活也不 running)。"""
+def test_await_handoff_baseline_never_running_owner_stuck_daemon_alive():
+    """r6+r7-2:baseline 代无论 pid 死活一律不算 running。owner 卡住但 gOLD 还活着(心跳新鲜)
+    → 超时返回结构化 **in_progress**(可重试,transition 仍有效),核心=**绝不 running**。"""
     clock = FakeClock()
     w = World(clock, held=True, last_loop=clock.wall_ms(),
               startup="running:gOLD", generation="gOLD")
     sf = FakeSingleflight(available=False)  # owner 永不释放(卡住)
     sup = w.supervisor(wait_s=1, probe_wait_s=1)
     sup.singleflight = sf
-    assert sup.ensure() == "failed"  # 只有 gOLD(==baseline),既不 acquire 也无新代 → 超时失败
+    r = sup.ensure()
+    assert r == "in_progress" and r != "running"  # gOLD==baseline 永不算成功;daemon 活着 → in_progress
+
+
+def test_await_handoff_owner_gone_daemon_dead_is_failed():
+    """r7-2:owner 释放锁但没留下活 daemon(心跳陈旧)→ 无进展 → failed(非 in_progress)。"""
+    clock = FakeClock()
+    w = World(clock, held=True, last_loop=clock.wall_ms() - HUNG_THRESHOLD_MS - 1,
+              startup="running:gOLD", generation="gOLD")
+    sf = FakeSingleflight(available=False)  # owner 卡住不释放,且 daemon 心跳陈旧
+    sup = w.supervisor(wait_s=1, probe_wait_s=1)
+    sup.singleflight = sf
+    assert sup.ensure() == "failed"
+
+
+def test_await_handoff_covers_full_takeover_critical_section():
+    """r7-2 核心 bug:busy waiter 上限须覆盖 owner **最坏临界区**(等旧锁释放 wait_s +
+    spawn 等新代就绪 wait_s+probe_wait_s = 2*wait_s+probe_wait_s)。owner 在
+    (wait_s+probe_wait_s, 2*wait_s+probe_wait_s] 之间结束 → 新上限等到 running,旧上限会假失败。"""
+    clock = FakeClock()
+    w = World(clock, held=True, last_loop=clock.wall_ms(),
+              startup="probing:gNEW", generation="gNEW")
+    sf = FakeSingleflight(available=False)
+    wait_s, probe_wait_s = 10, 5  # 旧上限 15s;新上限 25s
+    sup = w.supervisor(wait_s=wait_s, probe_wait_s=probe_wait_s)
+    sup.singleflight = sf
+
+    def sleep(s):
+        clock.tick(int(s * 1000))  # 真实推进单调时间 → monotonic deadline 生效
+        if clock.wall_ms() >= 20_000:  # owner 20s 后结束(> 旧 15s,< 新 25s)
+            w.startup = "running:gNEW"
+            w.last_loop = clock.wall_ms()
+            sf.available = True  # owner 释放 → waiter 拿锁自 ensure
+
+    sup.sleep = sleep
+    assert sup.ensure() == "running"  # 新上限覆盖到 20s → 等到;旧 15s 上限会在此前假失败
 
 
 def test_fast_path_does_not_bypass_singleflight():
@@ -530,3 +569,34 @@ def test_await_handoff_waits_full_owner_critical_section_for_slow_probing():
     assert sup.ensure() == "running"
     assert w.kills == [] and w.spawns == 0
     assert steps["n"] >= 30  # 确实等过了 wait_s-only 的上限
+
+
+# ===== r7-1: 结构化 ready 判定 =====
+
+def test_is_ready_result_semantics():
+    from lib import ctl
+    assert all(ctl.is_ready_result(r) for r in ("running", "started", "recovered"))
+    assert not any(ctl.is_ready_result(r) for r in ("in_progress", "failed", "down", "timeout", ""))
+
+
+# ===== r7-2: stopping 不算就绪(缩窗+可观测) =====
+
+def test_stopping_phase_not_ready(env):
+    from lib import ctl, db as dbmod
+    from lib.daemon_core import STARTUP_PHASES, set_startup_state
+    assert "stopping" in STARTUP_PHASES
+    st = {"last_loop_at": 1000, "daemon_generation": "g1", "startup": "stopping:g1"}
+    assert ctl.state_ready(st, now_ms=1000) is False  # 心跳新鲜也不算就绪(正在退出)
+    # daemon_healthy 亦排除 stopping
+    import lib.ctl as ctlmod
+    orig = ctlmod.daemon_lock_held
+    ctlmod.daemon_lock_held = lambda: True
+    try:
+        dbmod.set_state(env.conn, "daemon_generation", "g1")
+        dbmod.set_state(env.conn, "last_loop_at", env.clock.wall_ms())
+        set_startup_state(env.conn, "stopping", "g1")
+        assert ctl.daemon_healthy(env.conn, now_ms=env.clock.wall_ms()) is False
+        set_startup_state(env.conn, "running", "g1")
+        assert ctl.daemon_healthy(env.conn, now_ms=env.clock.wall_ms()) is True
+    finally:
+        ctlmod.daemon_lock_held = orig

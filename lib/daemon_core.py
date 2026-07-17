@@ -256,7 +256,9 @@ def mark_consumers_down(conn, keys):
         db.set_state(conn, f"consumer_{k}_ready", "down")
 
 
-STARTUP_PHASES = ("probing", "running", "degraded", "refused")
+# r7-2:'stopping' = daemon 决定退出、正在 shutdown(finally 首步写,mgr.shutdown 前)。
+# 缩窗+可观测,**非根治**冷启动窗口竞态(见 README 已知限制)。
+STARTUP_PHASES = ("probing", "running", "degraded", "refused", "stopping")
 _READY_PHASES = ("running", "degraded")
 
 
