@@ -15,7 +15,7 @@ from lib.listener_core import ListenerCore  # noqa: E402
 
 
 def ensure_daemon():
-    ctl_py = paths.skill_root() / "bin" / "bridgectl.py"
+    ctl_py = paths.pkg_root() / "bin" / "bridgectl.py"
     subprocess.Popen(
         [sys.executable, str(ctl_py), "ensure-daemon"],
         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,

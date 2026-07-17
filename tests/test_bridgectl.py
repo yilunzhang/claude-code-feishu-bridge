@@ -45,33 +45,43 @@ class TestBootstrap:
             ctl.bootstrap(auth_status_runner(), "other", SystemClock())
 
 
-class TestHooks:
-    def test_status_false_when_missing(self, data_dir):
-        st = ctl.hooks_status()
-        assert st["stop"] is False and st["session_end"] is False
+class TestHooksLiveStatus:
+    """plugin 化:hooks 由 plugin 提供,检测靠哨兵心跳(不读 settings.json 判手装)。"""
 
-    def test_status_true_when_installed(self, data_dir):
+    def test_not_seen_when_no_heartbeat(self, data_dir):
+        from lib import paths as pathsmod
+        pathsmod.ensure_data_dir()
+        st = ctl.hooks_live_status()
+        assert st["seen"] is False and st["fresh"] is False and st["age_s"] is None
+
+    def test_seen_and_fresh_after_hook_runs(self, data_dir, clock):
+        from lib import hooklib, paths as pathsmod
+        pathsmod.ensure_data_dir()
+        hooklib._touch_hook_heartbeat()  # 模拟 hook 运行写心跳
+        st = ctl.hooks_live_status()
+        assert st["seen"] is True and st["fresh"] is True and st["age_s"] is not None
+
+    def test_stale_heartbeat_not_fresh(self, data_dir):
+        from lib import paths as pathsmod, util
+        pathsmod.ensure_data_dir()
+        old_ts = 1000  # 远古时间戳
+        util.atomic_write(pathsmod.hook_heartbeat_path(), str(old_ts))
+        st = ctl.hooks_live_status(now_ms=old_ts + ctl.HOOK_HEARTBEAT_FRESH_MS + 1)
+        assert st["seen"] is True and st["fresh"] is False
+
+    def test_foreign_stop_hooks_detected(self, data_dir):
         p = paths.settings_json_path()
-        p.write_text(ctl.hooks_snippet())
-        st = ctl.hooks_status()
-        assert st["stop"] and st["session_end"]
+        p.write_text(json.dumps({"hooks": {"Stop": [
+            {"hooks": [{"type": "command", "command": "python3 /x/other_blocking_hook.py"}]}]}}))
+        assert ctl.foreign_stop_hooks() == ["python3 /x/other_blocking_hook.py"]
 
-    def test_other_stop_hooks_detected(self, data_dir):
+    def test_foreign_stop_hooks_ignores_own_and_missing(self, data_dir):
+        assert ctl.foreign_stop_hooks() == []  # 无 settings.json
         p = paths.settings_json_path()
-        snip = json.loads(ctl.hooks_snippet())
-        snip["hooks"]["Stop"].append(
-            {"hooks": [{"type": "command", "command": "python3 /x/other_blocking_hook.py"}]})
-        p.write_text(json.dumps(snip))
-        st = ctl.hooks_status()
-        assert st["stop"] and st["other_stop_hooks"] == ["python3 /x/other_blocking_hook.py"]
-
-    def test_snippet_shape(self, data_dir):
-        snip = json.loads(ctl.hooks_snippet())
-        stop_cmd = snip["hooks"]["Stop"][0]["hooks"][0]["command"]
-        end_cmd = snip["hooks"]["SessionEnd"][0]["hooks"][0]["command"]
-        assert "feishu-bridge/hooks/stop_hook.py" in stop_cmd
-        assert "feishu-bridge/hooks/session_end.py" in end_cmd
-        assert stop_cmd.startswith("python3 /")  # 绝对路径
+        p.write_text(json.dumps({"hooks": {"Stop": [
+            {"hooks": [{"type": "command",
+                        "command": "python3 /p/feishu-bridge/hooks/stop_hook.py"}]}]}}))
+        assert ctl.foreign_stop_hooks() == []  # 本 plugin 的不算 foreign
 
 
 class TestBindUnbind:

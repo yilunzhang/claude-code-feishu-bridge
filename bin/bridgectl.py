@@ -43,8 +43,10 @@ def cmd_bootstrap(args):
 
 def cmd_preflight(args):
     cfg = configmod.load_config()
-    hooks = ctl.hooks_status()
-    ready = bool(cfg) and hooks["stop"] and hooks["session_end"]
+    hooks = ctl.hooks_live_status()
+    # plugin 化:hooks 由 plugin 提供,不再要求手改 settings.json。ready 只看 config 是否已配置;
+    # hooks 生效与否作为**信息/提示**呈现(哨兵心跳),无法在同 turn 内硬性验证。
+    ready = bool(cfg)
     res = {
         "ok": ready,
         "config_present": bool(cfg),
@@ -53,13 +55,19 @@ def cmd_preflight(args):
     }
     if not cfg:
         res["next_steps"].append(
-            "运行: python3 bin/bridgectl.py bootstrap --profile <lark-cli profile 名>")
-    if not (hooks["stop"] and hooks["session_end"]):
+            "首次配置(每人一次):python3 bin/bridgectl.py bootstrap --profile <lark-cli profile 名>")
+    if not hooks["seen"]:
         res["next_steps"].append(
-            "手动把 hooks 片段合入 ~/.claude/settings.json(见 hooks_snippet),然后重启 CC 再重跑 bind;"
-            "本工具绝不代写 settings.json")
-        res["hooks_snippet"] = ctl.hooks_snippet()
-    if hooks.get("other_stop_hooks"):
+            "尚未检测到 plugin hooks 心跳(全新安装 / 尚未完成一轮对话时是正常的)。"
+            "hooks 由 plugin 自带 —— 若刚 /plugin install 或更新了 feishu-bridge,请**重启 Claude Code** "
+            "让 hooks 生效;之后随便完成一轮对话即会记录心跳(可再跑 preflight 确认)。"
+            "**绝不需要手改 settings.json。**")
+    elif not hooks["fresh"]:
+        res["next_steps"].append(
+            f"检测到 hooks 心跳但较旧(age {hooks['age_s']}s);若近期换过 plugin 版本,重启 CC 后完成一轮对话刷新。")
+    foreign = ctl.foreign_stop_hooks()
+    if foreign:
+        res["foreign_stop_hooks"] = foreign
         res["warning"] = ("检测到其它 Stop hook(可能是阻断型):同一 turn 可能触发多次 Stop,"
                           "普通 turn 存在重复转发组风险(plan 4.7 已声明限制;bind turn 有链闩保护)")
     out(res, 0 if ready else 3)
@@ -76,11 +84,10 @@ def cmd_chats(args):
 
 def cmd_bind(args):
     cfg = configmod.require_config()
-    hooks = ctl.hooks_status()
-    if not (hooks["stop"] and hooks["session_end"]):
-        # plan 4.1.1:hooks 未装 → 指引合入 + 重启 CC 后重跑,终止(不建 pending)
-        out({"ok": False, "error": "hooks 未安装:先合入片段并重启 CC(不建 pending)",
-             "hooks_snippet": ctl.hooks_snippet()}, 3)
+    # plugin 化:hooks 由 plugin 提供,不再硬阻断/要求手改 settings.json。绑定确认(握手)依赖
+    # Stop hook;若 hooks 未生效,握手不会完成,pending_bind 会在 TTL 后 bind_timeout 优雅收尾。
+    # 这里只做**软提示**(哨兵心跳),bind 照常进行。
+    hooks = ctl.hooks_live_status()
     state = ctl.ensure_daemon()
     # r7-1:bind 只在 daemon **结构化就绪**(is_ready_result)时继续,别再靠"排除字符串 failed"。
     if not ctl.is_ready_result(state):
@@ -98,6 +105,11 @@ def cmd_bind(args):
         out({"ok": False, "error": str(e), "code": e.code}, 4)
     res["ok"] = True
     res["daemon"] = state
+    res["hooks"] = hooks
+    if not hooks["seen"]:
+        res["hooks_note"] = ("未检测到 plugin hooks 心跳。绑定确认(握手)依赖 Stop hook —— "
+                             "若刚安装/更新 plugin,请确保**已重启 Claude Code** 让 hooks 生效。"
+                             "若约 10 分钟内群里未出现「✅ 已绑定」,说明 hooks 未生效:重启 CC 后重跑 bind。")
     res["next"] = ("1) 启动 persistent Monitor 跑 listener_cmd;"
                    "2) 在给用户的回复文本里原样包含 marker 一行(触发 Stop 握手);"
                    "3) 回复里带上 banner 提醒。")

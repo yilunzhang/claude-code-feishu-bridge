@@ -5,11 +5,13 @@ description: 把当前 Claude Code session 与一个飞书群一一绑定(build-
 
 # feishu-bridge:飞书群 ↔ 本地 CC session 绑定桥
 
-用法:`/feishu-bridge bind|unbind|status`。所有命令都从 skill 根目录跑:
+用法:`/feishu-bridge bind|unbind|status`。本 skill 随 **feishu-bridge plugin** 分发,代码(bin/lib/hooks)在 plugin 根;SKILL.md 位于 `skills/feishu-bridge/`,故 bin 在**上两级**。所有命令用 `${CLAUDE_SKILL_DIR}` 相对定位:
 
 ```bash
-SKILL=~/.claude/skills/feishu-bridge
+BIN="${CLAUDE_SKILL_DIR}/../../bin"
 ```
+
+hooks(Stop/SessionEnd)由 plugin 的 `hooks/hooks.json` **自带**——安装 plugin 并重启 CC 即生效,**无需手改 settings.json**。
 
 核心事实(影响你怎么做事):
 - **转发是自动的**:Stop hook 会把本 session 每 turn 的最终输出转发到绑定群。**绝不手工把最终答案再发一遍到群里**。
@@ -20,26 +22,26 @@ SKILL=~/.claude/skills/feishu-bridge
 
 1. **preflight**:
    ```bash
-   python3 $SKILL/bin/bridgectl.py preflight
+   python3 "$BIN/bridgectl.py" preflight
    ```
-   - `config_present=false` → 用 AskUserQuestion 问用户用哪个 lark-cli profile(可先 `lark-cli profile list` 看有哪些;默认主 profile),然后:
+   - `config_present=false` → 用 AskUserQuestion 问用户用哪个 lark-cli profile(可先 `lark-cli profile list` 看有哪些;默认主 profile),然后(首次配置,每人一次):
      ```bash
-     python3 $SKILL/bin/bridgectl.py bootstrap --profile <名>
+     python3 "$BIN/bridgectl.py" bootstrap --profile <名>
      ```
-   - hooks 未装(输出里有 `hooks_snippet`)→ 把片段展示给用户,指引:**先 `cp ~/.claude/settings.json ~/.claude/settings.json.bak-feishu-bridge` 备份,再手动合入片段,重启 CC 后重新跑 `/feishu-bridge bind`**。然后**终止本流程**(不建绑定)。你自己**绝不**改写 settings.json。
+   - `hooks.seen=false`(尚未检测到 plugin hooks 心跳)→ 这在**全新安装 / 尚未完成一轮对话**时是正常的。**不需要**手改 settings.json;若用户刚 `/plugin install` 或更新了 feishu-bridge,提醒**重启 Claude Code** 让 hooks 生效(重启后随便完成一轮对话就会记录心跳)。bind 仍可继续(见下)。
    - 输出带 `warning`(存在其它 Stop hook)→ 转告用户该已声明限制,可继续。
 
 2. **选群**:
    ```bash
-   python3 $SKILL/bin/bridgectl.py chats
+   python3 "$BIN/bridgectl.py" chats
    ```
    把群列表给用户选(AskUserQuestion)。bot 必须已在目标群里。
 
 3. **建绑定**:
    ```bash
-   python3 $SKILL/bin/bridgectl.py bind --chat-id <oc_...> --chat-name <群名>
+   python3 "$BIN/bridgectl.py" bind --chat-id <oc_...> --chat-name <群名>
    ```
-   失败(该群/本实例已有绑定)→ 照 error 提示处理。成功输出含 `binding_id` / `marker` / `banner` / `listener_cmd`。
+   失败(该群/本实例已有绑定)→ 照 error 提示处理。成功输出含 `binding_id` / `marker` / `banner` / `listener_cmd`;若输出带 `hooks_note`(未检测到 hooks 心跳),转告用户「若群里 10 分钟内没出现 ✅ 已绑定,说明 hooks 未生效,重启 CC 后重试」。
 
 4. **起 listener(persistent Monitor)**:
    ```
@@ -75,16 +77,16 @@ SKILL=~/.claude/skills/feishu-bridge
 ## unbind(立即生效;敏感操作前的逃生门)
 
 ```bash
-python3 $SKILL/bin/bridgectl.py unbind
+python3 "$BIN/bridgectl.py" unbind
 ```
 然后 TaskStop 掉 listener 的 Monitor 任务(listener 自己也会在几秒内自检退出)。告知用户已解绑;之后输出不再转发。事后可随时重新 bind。
 
 ## status / 排查
 
 ```bash
-python3 $SKILL/bin/bridgectl.py status
+python3 "$BIN/bridgectl.py" status
 ```
-关注:daemon `last_loop_age_s`(应 <5s)、consumer ready、各绑定 beat_age、`outbound_jobs` 里的 unknown/failed、counters。深度自检(真发送+撤回,须用户同意):`python3 $SKILL/bin/bridgectl.py doctor --chat-id <oc>`。
+关注:daemon `last_loop_age_s`(应 <5s)、consumer ready、各绑定 beat_age、`outbound_jobs` 里的 unknown/failed、counters。深度自检(真发送+撤回,须用户同意):`python3 "$BIN/bridgectl.py" doctor --chat-id <oc>`。
 
 ## 安全纪律
 

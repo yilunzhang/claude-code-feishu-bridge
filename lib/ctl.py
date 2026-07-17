@@ -64,48 +64,46 @@ def bootstrap(runner, profile, clock, chat_allowlist=None):
     return cfg
 
 
-# ---------------------------------------------------------------- hooks(只读 settings,绝不改写)
-def hook_command(name):
-    return f"python3 {paths.skill_root() / 'hooks' / name}"
+# ---------------------------------------------------------------- hooks(plugin 提供;检测生效)
+# plugin 化后 hooks 由 plugin 的 hooks/hooks.json 提供,**不再**手贴进 settings.json。
+# 无法在 bind 的同一 turn 内直接读"CC 是否已加载 plugin hooks";用**哨兵心跳**做正向检测:
+# Stop/SessionEnd hook 每次运行都写 hook_heartbeat(见 hooklib._touch_hook_heartbeat)。
+# 见过近期心跳 = plugin hooks 确已在本机某个 CC 会话里跑过 = 已生效(强信号);
+# 没见过 = 不确定(全新安装/尚未完成一轮对话是正常的)→ 不硬阻断,提示重启 CC。
+
+# "近期"窗口:一次对话轮结束就会刷新;给足冷启动/低频使用余量。
+HOOK_HEARTBEAT_FRESH_MS = 7 * 24 * 3600 * 1000  # 7 天
 
 
-def hooks_status():
-    p = paths.settings_json_path()
-    st = {"stop": False, "session_end": False, "settings_path": str(p),
-          "other_stop_hooks": []}
+def hooks_live_status(now_ms=None):
+    """返回 plugin hooks 的生效信号(哨兵心跳)。不读 settings.json、不要求手装。"""
+    p = paths.hook_heartbeat_path()
+    st = {"seen": False, "fresh": False, "age_s": None, "heartbeat_path": str(p)}
     try:
-        obj = json.loads(p.read_text())
+        ts = int(p.read_text().strip())
     except (OSError, ValueError):
         return st
-    hooks = obj.get("hooks") or {}
-
-    def commands(event):
-        for entry in hooks.get(event) or []:
-            for h in (entry or {}).get("hooks") or []:
-                cmd = (h or {}).get("command", "")
-                if cmd:
-                    yield cmd
-
-    st["stop"] = any("feishu-bridge/hooks/stop_hook.py" in c for c in commands("Stop"))
-    st["session_end"] = any("feishu-bridge/hooks/session_end.py" in c
-                            for c in commands("SessionEnd"))
-    # 4.7 已声明限制:与阻断型 Stop hook 共存 → 安装时检测+警告(重复组风险)
-    st["other_stop_hooks"] = [c for c in commands("Stop")
-                              if "feishu-bridge/hooks/stop_hook.py" not in c]
+    now = now_ms if now_ms is not None else int(time.time() * 1000)
+    st["seen"] = True
+    st["age_s"] = round((now - ts) / 1000, 1)
+    st["fresh"] = (now - ts) <= HOOK_HEARTBEAT_FRESH_MS
     return st
 
 
-def hooks_snippet():
-    return json.dumps({
-        "hooks": {
-            "Stop": [{"hooks": [{"type": "command",
-                                 "command": hook_command("stop_hook.py"),
-                                 "timeout": 15}]}],
-            "SessionEnd": [{"hooks": [{"type": "command",
-                                       "command": hook_command("session_end.py"),
-                                       "timeout": 15}]}],
-        }
-    }, indent=2, ensure_ascii=False)
+def foreign_stop_hooks():
+    """best-effort:扫 settings.json 里**非本 plugin** 的 Stop hook(D2 阻断型共存告警,信息性)。
+    读不到/无 = 空;绝不影响就绪判定。plugin 化后本 plugin 的 hooks 不在 settings.json。"""
+    try:
+        obj = json.loads(paths.settings_json_path().read_text())
+    except (OSError, ValueError):
+        return []
+    out = []
+    for entry in (obj.get("hooks") or {}).get("Stop") or []:
+        for h in (entry or {}).get("hooks") or []:
+            cmd = (h or {}).get("command", "")
+            if cmd and "feishu-bridge/hooks/stop_hook.py" not in cmd:
+                out.append(cmd)
+    return out
 
 
 # ---------------------------------------------------------------- chats
@@ -134,7 +132,7 @@ def bind_prepare(conn, cfg, clock, prober, chat_id, chat_name, cwd, start_pid):
     pid, lstart = inst
     res = lifecycle.create_binding(conn, chat_id=chat_id, chat_name=chat_name,
                                    cwd=cwd, cc_pid=pid, cc_start=lstart, clock=clock)
-    listener_cmd = f"python3 {paths.skill_root() / 'bin' / 'listener.py'} {res['binding_id']}"
+    listener_cmd = f"python3 {paths.pkg_root() / 'bin' / 'listener.py'} {res['binding_id']}"
     return {
         "binding_id": res["binding_id"],
         "marker": res["marker"],
@@ -533,7 +531,7 @@ def _read_daemon_state():
 
 
 def _spawn_daemon():
-    daemon_py = paths.skill_root() / "bin" / "daemon.py"
+    daemon_py = paths.pkg_root() / "bin" / "daemon.py"
     logf = open(paths.daemon_log_path(), "a")
     try:
         subprocess.Popen([sys.executable, str(daemon_py)],

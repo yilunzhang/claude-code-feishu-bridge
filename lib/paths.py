@@ -4,7 +4,9 @@ import os
 import pathlib
 
 
-def skill_root():
+def pkg_root():
+    """plugin/包 根目录(含 bin/lib/hooks/schema.sql)。lib/paths.py → parents[1] = 包根。
+    plugin 化后 = plugin root(仍 parents[1],因 lib/ 仍直接位于包根下,不受迁移影响)。"""
     return pathlib.Path(__file__).resolve().parents[1]
 
 
@@ -28,7 +30,7 @@ def db_path():
 
 
 def schema_path():
-    return skill_root() / "schema.sql"
+    return pkg_root() / "schema.sql"
 
 
 def config_path():
@@ -53,6 +55,12 @@ def daemon_log_path():
 
 def hook_drops_path():
     return data_dir() / "hook_drops.log"
+
+
+def hook_heartbeat_path():
+    # plugin 化:Stop/SessionEnd hook 每次运行(先于任何 db/网络)写此哨兵 = "plugin hooks 已生效"
+    # 的正向信号(替代读 settings.json 判断手装 hooks)。
+    return data_dir() / "hook_heartbeat"
 
 
 def media_root():

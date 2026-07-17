@@ -1,7 +1,9 @@
-# feishu-bridge — 飞书群 ↔ 本地 Claude Code session 绑定桥
+# feishu-bridge — 飞书群 ↔ 本地 Claude Code session 绑定桥(Claude Code plugin)
 
 设计:`~/csr/knowledge/feishu-bridge-plan.md` v7(七轮 codex 对抗评审收敛)。
-定位:Yilun 本机 build-in-public 桥。本地 CC session 与飞书群一一绑定;群内 @bot 消息投递进 session 作为指令;session 每 turn 最终输出自动转发回群。只管 `chat_type=group`(DM 桥 = `feishu-chat` skill)。
+定位:build-in-public 桥。本地 CC session 与飞书群一一绑定;群内 @bot 消息投递进 session 作为指令;session 每 turn 最终输出自动转发回群。只管 `chat_type=group`(DM 桥 = `feishu-chat` skill)。
+
+**打包形态 = 标准 Claude Code plugin**:plugin 根含 `.claude-plugin/plugin.json`、`skills/feishu-bridge/SKILL.md`(自动发现)、`hooks/hooks.json`(Stop/SessionEnd,自动加载),以及 `bin/ lib/ schema.sql tests/`。安装 plugin 即自带 hooks——**不再需要手改 `settings.json`**。
 
 ## 架构一图流
 
@@ -21,53 +23,31 @@
 
 不变量(plan §2):未绑定 session 的输出绝不外发(含 bind turn 自身,fail-closed);投递判定零模型参与;一切外发经 outbound_jobs 由 daemon 发出;所有状态推进=带旧状态 CAS。
 
-## 安装(一次性)
+## 安装
 
-1. 依赖:macOS 系统 `python3`(≥3.9,纯标准库)、已登录的 `lark-cli`(bot+user 双身份)。
-2. **hooks 手动合入**(本工具绝不改写 settings.json):
+依赖:系统 `python3`(≥3.9,纯标准库)、已登录的 `lark-cli`(bot+user 双身份)。
 
-   ```bash
-   cp ~/.claude/settings.json ~/.claude/settings.json.bak-feishu-bridge
-   ```
+**A. 安装 plugin**(每机一次):
 
-   然后把下面片段合入 `~/.claude/settings.json`(若已有 `hooks.Stop`/`hooks.SessionEnd` 数组,把对象追加进去):
+```
+# 从 marketplace 安装(分发就绪后)
+/plugin marketplace add <marketplace-url>
+/plugin install feishu-bridge
 
-   ```json
-   {
-     "hooks": {
-       "Stop": [
-         {
-           "hooks": [
-             {
-               "type": "command",
-               "command": "python3 /Users/skysniper/.claude/skills/feishu-bridge/hooks/stop_hook.py",
-               "timeout": 15
-             }
-           ]
-         }
-       ],
-       "SessionEnd": [
-         {
-           "hooks": [
-             {
-               "type": "command",
-               "command": "python3 /Users/skysniper/.claude/skills/feishu-bridge/hooks/session_end.py",
-               "timeout": 15
-             }
-           ]
-         }
-       ]
-     }
-   }
-   ```
+# 或本地开发/试用:指向 plugin 根目录(含 .claude-plugin/plugin.json)
+claude --plugin-dir ~/csr/feishu-bridge
+```
 
-   合入后**重启 Claude Code**(hooks 在会话启动时快照)。`bridgectl preflight` 会校验安装并给出同样的片段;若检测到其它 Stop hook 会给出"阻断型共存"警告(见已知限制)。
-3. 指纹初始化(首次;profile 一经选定钉死):
+安装后**重启 Claude Code**(hooks 在会话启动时加载)。`hooks/hooks.json` 由 CC 自动发现,Stop/SessionEnd hook 用 `${CLAUDE_PLUGIN_ROOT}` 自定位——**无需任何手改 settings.json**。`bridgectl preflight` 会通过「hooks 心跳」确认 hooks 是否已生效(hook 每次运行写一个哨兵;见「排查」)。
 
-   ```bash
-   python3 ~/.claude/skills/feishu-bridge/bin/bridgectl.py bootstrap --profile <lark-cli profile 名> \
-     [--chat-allowlist oc_xxx,oc_yyy]
-   ```
+**B. 配置身份指纹**(每人一次;profile 一经选定钉死):在 CC 里跑 `/feishu-bridge` 走引导,或直接:
+
+```bash
+python3 <plugin根>/bin/bridgectl.py bootstrap --profile <lark-cli profile 名> \
+  [--chat-allowlist oc_xxx,oc_yyy]
+```
+
+(`<plugin根>` = plugin 安装目录;SKILL.md 内用 `${CLAUDE_SKILL_DIR}/../../bin` 自动定位。)
 
    `--chat-allowlist`(可选):逗号分隔的 chat_id 白名单,用于**灰度/测试隔离**——覆盖全链:
    入站事件在任何入库/回复之前直接丢弃(零副作用零痕迹);列外群的审批回调按无效处理;
@@ -79,8 +59,8 @@
 CC 里 `/feishu-bridge`(见 SKILL.md);或手动:
 
 ```bash
-B=~/.claude/skills/feishu-bridge/bin/bridgectl.py
-python3 $B preflight            # 就绪检查(config + hooks)
+B=<plugin根>/bin/bridgectl.py   # plugin 安装目录;SKILL.md 内用 ${CLAUDE_SKILL_DIR}/../../bin 自动定位
+python3 $B preflight            # 就绪检查(config + hooks 心跳)
 python3 $B chats                # 列群(bot 须已入群)
 python3 $B bind --chat-id oc_x --chat-name 某群   # 建绑定(自动拉起 daemon)
 python3 $B status               # 全景状态
@@ -102,19 +82,20 @@ bind 完整握手需要 CC 侧:起 persistent Monitor 跑 `bin/listener.py <bind
 
 | 路径 | 内容 |
 |---|---|
-| `~/.claude/data/feishu-bridge/` | 数据目录(0700) |
+| `~/.claude/data/feishu-bridge/` | 数据目录(0700);**固定路径**——四类进程(hook/daemon/listener/CLI)共享同一 `bridge.db`,detached daemon 拿不到 `${CLAUDE_PLUGIN_DATA}`,故不随 plugin 走 |
 | ├ `bridge.db` | SQLite WAL,唯一持久真相(schema 见 `schema.sql`) |
 | ├ `config.json` | 指纹:profile/app_id/bot_open_id/owner_open_id/cli_version(钉死) |
 | ├ `bridge.lock` | daemon flock 单例锁 |
+| ├ `hook_heartbeat` | plugin hooks 生效哨兵(hook 每次运行写墙钟 ms;preflight 据此判 hooks 是否已加载) |
 | ├ `daemon.log` / `hook_drops.log` | daemon 日志 / hook fail-closed 丢弃记录(轮转,无正文) |
 | └ `media/<binding>/<message>/` | 附件物化(原子 rename;终态消息 7 天后清理) |
 
-代码:`bin/daemon.py`(守护进程)· `bin/listener.py`(Monitor 内)· `bin/bridgectl.py`(CLI)· `hooks/stop_hook.py` + `hooks/session_end.py`(只写库)· `lib/*`(核心逻辑)· `schema.sql` · `tests/`。
+代码在 **plugin 根**下:`.claude-plugin/plugin.json`(清单)· `skills/feishu-bridge/SKILL.md`(自动发现)· `hooks/hooks.json`(自动加载)+ `hooks/stop_hook.py`/`session_end.py`(只写库)· `bin/daemon.py`(守护进程)· `bin/listener.py`(Monitor 内)· `bin/bridgectl.py`(CLI)· `lib/*`(核心逻辑)· `schema.sql` · `tests/`。所有 Python 自定位靠 `Path(__file__).resolve().parents[1]` = plugin 根(bin/lib/hooks 均直接位于根下)。
 
 ## 测试
 
 ```bash
-cd ~/.claude/skills/feishu-bridge && python3 -m pytest tests/ -q
+cd <plugin根> && python3 -m pytest tests/ -q
 ```
 
 全程离线:lark-cli 经可注入 runner(fake 按本机实测契约造形),事件流=可注入行迭代器,进程探测/时钟均可注入。覆盖 plan §6 全矩阵(DDL 真跑、bind-turn 双 Stop 链闩、双 listener epoch 抢占、审批崩溃缝重放、inbox 钉死、waiting_binding 激活重过审批门、pending_bind 超时、per-kind 守卫、chunk 组内/组间序、判死矩阵含睡眠宽限与时钟回拨、unbind 级联+线性化、限速配额、sending→unknown、callback 单事务、ENOSPC)+ 指纹/版本门、bind 自愈(bind_superseded)、卡片重臂、daemon 挂死接管、consumer respawn 卫生。
