@@ -30,13 +30,15 @@
 **A. 安装 plugin**(每机一次):
 
 ```
-# 从 marketplace 安装(分发就绪后)
-/plugin marketplace add <marketplace-url>
+# 从 marketplace 安装(GitHub)
+/plugin marketplace add https://github.com/yilunzhang/claude-code-feishu-bridge.git
 /plugin install feishu-bridge
 
 # 或本地开发/试用:指向 plugin 根目录(含 .claude-plugin/plugin.json)
-claude --plugin-dir ~/csr/feishu-bridge
+claude --plugin-dir <克隆位置>/claude-code-feishu-bridge
 ```
+
+> 内部同事另有镜像分发源(需 VPN),地址见内部分发文档。
 
 安装后**重启 Claude Code**(hooks 在会话启动时加载)。skill 的 slash 入口 = **`/feishu-bridge:bridge`**(plugin 名:skill 名)。`hooks/hooks.json` 由 CC 自动发现(exec form,`command:"python3"` + `args:["${CLAUDE_PLUGIN_ROOT}/hooks/…"]`),Stop/SessionEnd hook 自定位——**无需任何手改 settings.json**。`preflight` 通过分事件「hooks 心跳」(Stop/SessionEnd 各一个哨兵,记 event/时间/plugin 版本/pkg_root)确认 hooks 是否已生效——**advisory only**,权威证明是「握手成功 + 群内 ✅ 已绑定」。
 
