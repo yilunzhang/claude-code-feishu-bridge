@@ -275,22 +275,26 @@ def set_startup_state(conn, phase, generation):
 
 
 def record_daemon_identity(conn, clock, prober):
-    """r3-5/r4-1:拿锁+建 conn 后立即记身份、**首次心跳(仅表活着)**、
-    startup_state=probing:<gen>(gate.startup 前)。**heartbeat 与 startup_state 分义**:
-    heartbeat 只说"进程活着",startup_state 才说"是否就绪"——消除"首心跳被当启动完成"的双义。
-    r4-2:同代 generation 一建立立即把所有 consumer_*_ready 置 down(不等 mgr.start_all)。
+    """r3-5/r4-1/r5-M1:拿锁+建 conn 后**原子发布**本代身份、首次心跳(仅表活着)、
+    startup=probing:<gen>、consumer down —— 同一事务,避免"拿锁到 record_identity 之间"
+    被 supervisor 读到半态(旧代 tuple 完整对齐)。
+    heartbeat 与 startup_state 分义:heartbeat 只说"进程活着",startup_state 才说"是否就绪"。
+    r5-M1:generation 用**进程内唯一 token**(uuid4;不用 pid/时间——pid 可复用、同 ms 可碰撞)。
     返回本代 generation token。"""
     import os as _os
-    from . import procs as _procs
-    gen = f"{_os.getpid()}-{clock.wall_ms()}"
-    db.set_state(conn, "daemon_pid", _os.getpid())
-    db.set_state(conn, "daemon_started_at", clock.wall_ms())
-    ident = _procs.self_identity(prober, _os.getpid())
-    db.set_state(conn, "daemon_proc_start", ident[1] if ident else "")
-    db.set_state(conn, "daemon_generation", gen)
-    db.set_state(conn, "startup", f"probing:{gen}")
-    db.set_state(conn, "last_loop_at", clock.wall_ms())
-    mark_consumers_down(conn, [RECEIVE_KEY, CARD_KEY])  # r4-2:跨代即刻清 ready
+    from . import procs as _procs, util as _util
+    pid = _os.getpid()
+    now = clock.wall_ms()
+    ident = _procs.self_identity(prober, pid)
+    gen = f"{pid}-{_util.new_id()}"  # uuid4 保证唯一;pid 前缀便于排障
+    with db.tx(conn):  # 原子发布(单事务)
+        db.set_state(conn, "daemon_pid", pid)
+        db.set_state(conn, "daemon_started_at", now)
+        db.set_state(conn, "daemon_proc_start", ident[1] if ident else "")
+        db.set_state(conn, "daemon_generation", gen)
+        db.set_state(conn, "startup", f"probing:{gen}")
+        db.set_state(conn, "last_loop_at", now)
+        mark_consumers_down(conn, [RECEIVE_KEY, CARD_KEY])  # r4-2:跨代即刻清 ready
     return gen
 
 

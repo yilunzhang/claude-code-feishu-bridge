@@ -325,12 +325,21 @@ def daemon_healthy(conn, now_ms=None):
     return state_ready(st, now)
 
 
+# r5-M2:等 probing 结论(record_identity + gate.startup,最坏探测 auth~20s + version~10s)的上限,
+# 覆盖探测最坏 + 余量;心跳新鲜的 probing 期间绝不 takeover。
+STARTUP_PROBE_WAIT_S = 40
+
+
 class DaemonSupervisor:
     """依赖全注入的 ensure 逻辑(可测):lock_held()/read_state()/spawn()/kill(pid,sig);
-    singleflight(可选,对象须有 try_acquire()/release())防重叠接管(r2-M1④)。"""
+    singleflight(可选,对象须有 try_acquire()/release())防重叠接管(r2-M1④)。
+    r5:liveness(心跳)与 readiness(startup+generation)分离——
+    ① takeover(SIGTERM+重启)**只依据心跳陈旧**,绝不因'尚未就绪'而杀;
+    ② 心跳新鲜的 probing → 等结论(不 kill);refused → 终态失败(不重启);
+    ③ 拉起/等待路径以 baseline generation 拒'旧代完整对齐'假成功(M1)。"""
 
     def __init__(self, *, lock_held, read_state, spawn, kill, prober,
-                 now_ms, sleep, wait_s=12, singleflight=None):
+                 now_ms, sleep, wait_s=12, singleflight=None, probe_wait_s=None):
         self.lock_held = lock_held
         self.read_state = read_state
         self.spawn = spawn
@@ -340,65 +349,130 @@ class DaemonSupervisor:
         self.sleep = sleep
         self.wait_s = wait_s
         self.singleflight = singleflight
+        self.probe_wait_s = probe_wait_s if probe_wait_s is not None else STARTUP_PROBE_WAIT_S
 
-    def _fresh(self, st):
-        """r4-1:就绪判定 = state_ready(心跳新鲜 ∧ startup running/degraded ∧ 同代)。"""
+    # ---- 判定原语:严格区分 liveness 与 readiness ----
+    def _ready(self, st):
         return state_ready(st, self.now_ms())
 
-    def _await_health(self):
-        """并发接管者在干活:本次只等结果,零 kill 零 spawn。"""
-        for _ in range(int(self.wait_s / _POLL_STEP_S) + 1):
-            if self.lock_held() and self._fresh(self.read_state()):
-                return "running"
-            self.sleep(_POLL_STEP_S)
-        return "failed"
+    def _heartbeat_fresh(self, st):
+        """liveness:仅看心跳,不看 startup(r5-M2:takeover 只依此)。"""
+        if not st or st.get("last_loop_at") is None:
+            return False
+        return (self.now_ms() - int(st["last_loop_at"])) <= HUNG_THRESHOLD_MS
 
+    def _gen_of(self, st):
+        from .daemon_core import parse_startup
+        return (st or {}).get("daemon_generation") or parse_startup((st or {}).get("startup"))[1]
+
+    def _phase_of(self, st):
+        from .daemon_core import parse_startup
+        return parse_startup((st or {}).get("startup"))[0]
+
+    def _pid_alive(self, st):
+        pid = (st or {}).get("daemon_pid")
+        pstart = (st or {}).get("daemon_proc_start")
+        if not pid or not pstart:
+            return False
+        return procs.probe_alive(self.prober, int(pid), pstart) == procs.ALIVE
+
+    # ---- 入口 ----
     def ensure(self):
-        if self.lock_held() and self._fresh(self.read_state()):
-            return "running"  # 快路径,无须 singleflight
+        # r5-M1④:健康态 fast-path 也必须经 singleflight,不越过正在进行的 ensure。
         if self.singleflight is not None:
             if not self.singleflight.try_acquire():
-                return self._await_health()
+                # 另一 ensure 在处理:等它的结果,以当前代为 baseline 拒旧代残留(M1)
+                return self._await_health(self._gen_of(self.read_state()))
             try:
                 return self._ensure_locked()
             finally:
                 self.singleflight.release()
         return self._ensure_locked()
 
-    def _ensure_locked(self):
-        import signal as _signal
-        if self.lock_held():
+    def _await_health(self, baseline_gen):
+        """等并发 ensure 的结果:承认'新代就绪(gen != baseline)'或'当前代就绪且 pid 存活'
+        (后者=稳态健康,并非旧代残留;旧代残留的 pid 已死,被排除)。零 kill 零 spawn。"""
+        for _ in range(int(self.wait_s / _POLL_STEP_S) + 1):
             st = self.read_state()
-            if self._fresh(st):
-                return "running"  # 等锁期间对方已恢复
-            # 挂死:精确身份匹配才杀
-            pid = st.get("daemon_pid") if st else None
-            pstart = st.get("daemon_proc_start") if st else None
-            if not pid or not pstart:
-                return "failed"
-            if procs.probe_alive(self.prober, int(pid), pstart) != procs.ALIVE:
-                return "failed"  # pid 复用/探测不确定:绝不杀
-            try:
-                self.kill(int(pid), _signal.SIGTERM)
-            except OSError:
-                return "failed"
-            for _ in range(int(self.wait_s / _POLL_STEP_S) + 1):
-                if not self.lock_held():
-                    break
-                self.sleep(_POLL_STEP_S)
-            else:
-                return "failed"
-            return "recovered" if self._spawn_and_wait() == "started" else "failed"
+            if self.lock_held() and self._ready(st) \
+                    and (self._gen_of(st) != baseline_gen or self._pid_alive(st)):
+                return "running"
+            self.sleep(_POLL_STEP_S)
+        return "failed"
+
+    def _ensure_locked(self):
+        st = self.read_state()
+        if self.lock_held() and self._ready(st):
+            return "running"  # 稳态健康(singleflight 下无并发重启,可信)
+        if self.lock_held():
+            if self._heartbeat_fresh(st):
+                # r5-M2:心跳新鲜 → 绝不 takeover。按 startup 相位处置:
+                phase = self._phase_of(st)
+                if phase == "refused":
+                    return self._await_lock_release_then_failed()  # 终态,不重启
+                return self._await_probing_conclusion()  # probing/未知:等结论,不 kill
+            # 心跳陈旧 = 真挂死 → 精确身份匹配 takeover(唯一 kill 路径)
+            return self._takeover_and_restart(st)
         return self._spawn_and_wait()
 
-    def _spawn_and_wait(self):
-        self.spawn()
+    def _await_lock_release_then_failed(self):
         for _ in range(int(self.wait_s / _POLL_STEP_S) + 1):
+            if not self.lock_held():
+                break
             self.sleep(_POLL_STEP_S)
-            # r4-1:就绪 = state_ready(startup 得出 running/degraded);
-            # probing 期间继续等,refused/退出 → 锁释放 → 超时 failed(bind 不会继续)
-            if self.lock_held() and self._fresh(self.read_state()):
+        return "failed"
+
+    def _await_probing_conclusion(self):
+        """r5-M2:等心跳新鲜的 probing 得出结论;就绪→running;refused/退出→failed;
+        超时或中途心跳陈旧→failed(**不 kill**;下次 ensure 才依陈旧心跳接管)。"""
+        for _ in range(int(self.probe_wait_s / _POLL_STEP_S) + 1):
+            st = self.read_state()
+            if not self.lock_held():
+                return "failed"  # daemon 退出(如 refused)
+            if self._ready(st):
+                return "running"
+            if self._phase_of(st) == "refused":
+                return self._await_lock_release_then_failed()
+            if not self._heartbeat_fresh(st):
+                return "failed"  # 中途挂死:本次不误杀,交下次 ensure 接管
+            self.sleep(_POLL_STEP_S)
+        return "failed"
+
+    def _takeover_and_restart(self, st):
+        import signal as _signal
+        pid = st.get("daemon_pid") if st else None
+        pstart = st.get("daemon_proc_start") if st else None
+        if not pid or not pstart:
+            return "failed"
+        if procs.probe_alive(self.prober, int(pid), pstart) != procs.ALIVE:
+            return "failed"  # pid 复用/探测不确定:绝不杀
+        try:
+            self.kill(int(pid), _signal.SIGTERM)
+        except OSError:
+            return "failed"
+        for _ in range(int(self.wait_s / _POLL_STEP_S) + 1):
+            if not self.lock_held():
+                break
+            self.sleep(_POLL_STEP_S)
+        else:
+            return "failed"
+        return "recovered" if self._spawn_and_wait() == "started" else "failed"
+
+    def _spawn_and_wait(self):
+        baseline = self._gen_of(self.read_state())  # r5-M1:spawn 前记 baseline generation
+        self.spawn()
+        # 等待上限覆盖新 daemon 的 record_identity + gate.startup 探测最坏(probe)+ 拉起余量。
+        steps = int((self.wait_s + self.probe_wait_s) / _POLL_STEP_S) + 1
+        for _ in range(steps):
+            self.sleep(_POLL_STEP_S)
+            st = self.read_state()
+            gen = self._gen_of(st)
+            # r5-M1:只承认**新代**(gen != baseline)就绪;旧代完整对齐(gen==baseline)一律不算。
+            if self.lock_held() and self._ready(st) and gen != baseline:
                 return "started"
+            # 新代明确 refused → 失败(不再空等到超时;bind 不会继续)
+            if self.lock_held() and gen != baseline and self._phase_of(st) == "refused":
+                return "failed"
         return "failed"
 
 

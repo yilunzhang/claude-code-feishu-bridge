@@ -260,3 +260,161 @@ class TestStartupStateGate:
         sup = w.supervisor(wait_s=5)
         sup.sleep = refusing_sleep
         assert sup.ensure() == "failed"
+
+
+# ===== r5-M1: 旧代完整 tuple 假成功窗 =====
+
+def test_spawn_wait_rejects_stale_aligned_old_generation():
+    """r5-M1 回归:spawn 后 DB 仍是**旧代完整对齐**(新鲜心跳 + running:gOLD + gen=gOLD),
+    模拟'新 daemon 已拿 flock 但尚未 record_identity' → 结果**不是** started。"""
+    clock = FakeClock()
+    w = World(clock, held=False, last_loop=None, startup="running:gOLD", generation="gOLD")
+
+    def stale_spawn():
+        w.spawns += 1
+        w.held = True
+        w.last_loop = clock.wall_ms()  # 新鲜心跳,但仍是旧代残留
+        # 不发布新代:startup/generation 保持 gOLD
+
+    w.spawn = stale_spawn
+    sup = w.supervisor(wait_s=1, probe_wait_s=1)
+    assert sup.ensure() == "failed"  # 旧代完整对齐 ≠ 新进程就绪
+    assert w.spawns == 1 and w.kills == []
+
+
+def test_spawn_wait_accepts_only_new_generation():
+    """对照:发布新代 gNEW 就绪 → started。"""
+    clock = FakeClock()
+    w = World(clock, held=False, last_loop=None, startup="running:gOLD", generation="gOLD")
+
+    def real_spawn():
+        w.spawns += 1
+        w.held = True
+        w.startup = "running:gNEW"
+        w.generation = "gNEW"
+        w.last_loop = clock.wall_ms()
+
+    w.spawn = real_spawn
+    assert w.supervisor(wait_s=2, probe_wait_s=2).ensure() == "started"
+
+
+def test_await_health_admits_current_running_pid_alive():
+    """并发 ensure 在处理时的等待路径:当前代就绪且 pid 活 → running(不因 gen==baseline 假失败)。"""
+    clock = FakeClock()
+    w = World(clock, held=True, last_loop=clock.wall_ms() - 1000,
+              startup="running:g1", generation="g1")
+    sf = FakeSingleflight(available=False)  # 另一 ensure 持锁
+    sup = w.supervisor(wait_s=2)
+    sup.singleflight = sf
+    assert sup.ensure() == "running"
+    assert w.kills == [] and w.spawns == 0
+
+
+def test_await_health_rejects_stale_dead_pid_generation():
+    """等待路径:旧代 running 但 daemon_pid 已死 → 不认(排除旧代残留)。"""
+    clock = FakeClock()
+    w = World(clock, held=True, last_loop=clock.wall_ms(),
+              startup="running:gOLD", generation="gOLD")
+    w.prober.remove(DPID)  # 旧代进程已死
+    sf = FakeSingleflight(available=False)
+    sup = w.supervisor(wait_s=1)
+    sup.singleflight = sf
+    assert sup.ensure() == "failed"
+
+
+def test_fast_path_does_not_bypass_singleflight():
+    """r5-M1④:健康态 fast-path 也必须经 singleflight(不越过正在进行的 ensure)。"""
+    clock = FakeClock()
+    w = World(clock, held=True, last_loop=clock.wall_ms(),
+              startup="running:g1", generation="g1")
+    sf = FakeSingleflight(available=True)
+    sup = w.supervisor()
+    sup.singleflight = sf
+    assert sup.ensure() == "running"
+    assert sf.acquired == 1 and sf.released == 1  # 走了 singleflight,没绕过
+
+
+# ===== r5-M2: 误杀健康 probing =====
+
+def test_fresh_probing_not_killed_waits_conclusion_running():
+    """r5-M2:心跳新鲜的 probing 绝不 kill;等其结论 running → ready。"""
+    clock = FakeClock()
+    w = World(clock, held=True, last_loop=clock.wall_ms(),
+              startup="probing:g1", generation="g1")
+    steps = {"n": 0}
+
+    def sleep(s):
+        steps["n"] += 1
+        w.last_loop = clock.wall_ms()  # 探测中持续心跳
+        if steps["n"] >= 2:
+            w.startup = "running:g1"
+
+    sup = w.supervisor(probe_wait_s=5)
+    sup.sleep = sleep
+    assert sup.ensure() == "running"
+    assert w.kills == [] and w.spawns == 0
+
+
+def test_fresh_probing_concludes_degraded_is_ready():
+    clock = FakeClock()
+    w = World(clock, held=True, last_loop=clock.wall_ms(),
+              startup="probing:g1", generation="g1")
+    steps = {"n": 0}
+
+    def sleep(s):
+        steps["n"] += 1
+        w.last_loop = clock.wall_ms()
+        if steps["n"] >= 2:
+            w.startup = "degraded:g1"
+
+    sup = w.supervisor(probe_wait_s=5)
+    sup.sleep = sleep
+    assert sup.ensure() == "running"
+    assert w.kills == []
+
+
+def test_lock_held_refused_returns_failed_no_restart():
+    """r5-M2:refused 终态 → 等锁释放返回失败,不进接管/重启分支。"""
+    clock = FakeClock()
+    w = World(clock, held=True, last_loop=clock.wall_ms(),
+              startup="refused:g1", generation="g1")
+    steps = {"n": 0}
+
+    def sleep(s):
+        steps["n"] += 1
+        if steps["n"] >= 2:
+            w.held = False  # daemon 退出释放锁
+
+    sup = w.supervisor()
+    sup.sleep = sleep
+    assert sup.ensure() == "failed"
+    assert w.kills == [] and w.spawns == 0
+
+
+def test_slow_probe_timeout_not_mis_killed():
+    """r5-M2:合法慢探测(心跳一直新鲜、始终 probing)超时 → 返回失败但**绝不误杀**。"""
+    clock = FakeClock()
+    w = World(clock, held=True, last_loop=clock.wall_ms(),
+              startup="probing:g1", generation="g1")
+
+    def sleep(s):
+        w.last_loop = clock.wall_ms()  # 探测中,心跳始终新鲜
+
+    sup = w.supervisor(probe_wait_s=1)
+    sup.sleep = sleep
+    assert sup.ensure() == "failed"
+    assert w.kills == [] and w.spawns == 0
+
+
+def test_probing_then_heartbeat_goes_stale_next_ensure_takes_over():
+    """probing 中途 daemon 挂死(心跳陈旧)→ 本次不误杀返回失败;下次 ensure 才接管。"""
+    clock = FakeClock()
+    w = World(clock, held=True, last_loop=clock.wall_ms(),
+              startup="probing:g1", generation="g1")
+    # 心跳不再更新(挂死);sleep 推进单调时间使其陈旧
+    def sleep(s):
+        clock.tick(200_000)
+    sup = w.supervisor(probe_wait_s=2)
+    sup.sleep = sleep
+    r1 = sup.ensure()
+    assert r1 == "failed" and w.kills == []  # 本次不 kill(进入时是 fresh probing)
