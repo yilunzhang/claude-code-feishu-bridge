@@ -87,6 +87,7 @@ PERMANENT_SEND_CODES = frozenset({
     230013,    # bot 能力未启用
     99991672,  # app 缺权限 scope
     230099,    # 回复目标消息不存在/已撤回
+    99992402,  # field validation failed(参数校验;E4 真机实锤,含幂等键超长)
 })
 TRANSIENT_SEND_CODES = frozenset({
     230020,    # 请求频控

@@ -118,7 +118,7 @@ cd ~/.claude/skills/feishu-bridge && python3 -m pytest tests/ -q
 
 全程离线:lark-cli 经可注入 runner(fake 按本机实测契约造形),事件流=可注入行迭代器,进程探测/时钟均可注入。覆盖 plan §6 全矩阵(DDL 真跑、bind-turn 双 Stop 链闩、双 listener epoch 抢占、审批崩溃缝重放、inbox 钉死、waiting_binding 激活重过审批门、pending_bind 超时、per-kind 守卫、chunk 组内/组间序、判死矩阵含睡眠宽限与时钟回拨、unbind 级联+线性化、限速配额、sending→unknown、callback 单事务、ENOSPC)+ 指纹/版本门、bind 自愈(bind_superseded)、卡片重臂、daemon 挂死接管、consumer respawn 卫生。
 
-**已实测契约(leader 2026-07-16 真机验证)**:lark-cli = **1.0.66**;`+messages-reply --msg-type interactive --content <card> --idempotency-key` → `ok:true` + `.data.message_id`,同 key 幂等同 id(审批卡片走此路径,fake 契约与真机一致);S3(hook/skill 进程 ppid 链上溯解析 CC 实例)已在真实进程树验证通过。
+**已实测契约(leader 2026-07-16 真机验证)**:lark-cli = **1.0.66**;`+messages-reply --msg-type interactive --content <card> --idempotency-key` → `ok:true` + `.data.message_id`,同 key 幂等同 id(审批卡片走此路径,fake 契约与真机一致);S3(hook/skill 进程 ppid 链上溯解析 CC 实例)已在真实进程树验证通过;mget 正文在**顶层 `content`**(渲染文本,E3);**错误信封可能打在 stderr**(stdout 空,code 嵌套 `.error.code`,E4a)→ 解析 stdout→stderr 回退;`--idempotency-key` 上限 ~50 字符(超长报 99992402,E4b)→ wire 一律传 `fb:`+sha1 短键(≤40),DB 保留可读逻辑键;`--version` 不吃全局 `--profile`(E1)。
 
 ## 已知限制(plan §8 + 诚实语义)
 

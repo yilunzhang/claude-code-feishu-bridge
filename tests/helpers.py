@@ -45,6 +45,14 @@ def err_envelope(code, msg="err"):
     return FakeRunResult(1, json.dumps({"ok": False, "code": code, "msg": msg}))
 
 
+def stderr_err_envelope(code, subtype="invalid_parameters", msg="field validation failed"):
+    """E4a 真机形状:错误信封打在 stderr(stdout 空),code 嵌套在 .error.code。"""
+    return FakeRunResult(
+        1, "", json.dumps({"ok": False, "error": {
+            "type": "api", "subtype": subtype, "code": code, "message": msg}},
+            ensure_ascii=False))
+
+
 class FakeRunner:
     """可注入 lark-cli runner。responders: list of (predicate(args)->bool, fn(args, cwd)->FakeRunResult)。
     未匹配调用默认抛 AssertionError(离线铁律:绝不静默放过未预期的外呼)。

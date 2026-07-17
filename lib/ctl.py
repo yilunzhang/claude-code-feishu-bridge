@@ -436,7 +436,7 @@ def doctor(runner, chat_id, clock, cfg=None):
     res = runner.run(["im", "+messages-send", "--as", "bot", "--chat-id", chat_id,
                       "--text", f"feishu-bridge doctor 自检 {clock.wall_ms()}(即将撤回)",
                       "--idempotency-key", key], timeout_s=30)
-    env = runner_mod.parse_envelope(res.stdout)
+    env = runner_mod.parse_result(res)  # E4a:stderr 信封回退
     if not runner_mod.envelope_ok(env):
         return {"ok": False, "step": "send", "detail": (res.stdout or res.stderr or "")[:400]}
     mid = runner_mod.data_of(env).get("message_id")
@@ -444,7 +444,7 @@ def doctor(runner, chat_id, clock, cfg=None):
         return {"ok": False, "step": "send", "detail": "no message_id"}
     rc = runner.run(["api", "DELETE", f"/open-apis/im/v1/messages/{mid}", "--as", "bot"],
                     timeout_s=30)
-    rc_env = runner_mod.parse_envelope(rc.stdout)
+    rc_env = runner_mod.parse_result(rc)
     recalled = runner_mod.envelope_ok(rc_env)
     out = {"ok": recalled, "step": "recall", "message_id": mid, "recalled": recalled}
     if recalled and cfg:

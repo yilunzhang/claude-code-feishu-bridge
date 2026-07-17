@@ -95,6 +95,38 @@ def parse_envelope(stdout):
     return None
 
 
+def parse_result(res):
+    """E4a(真机实锤):lark-cli 出错时错误信封可能打在 **stderr**(stdout 空)。
+    解析顺序:stdout → 空/不可解析时回退 stderr。"""
+    env = parse_envelope(res.stdout)
+    if env is None:
+        env = parse_envelope(res.stderr)
+    return env
+
+
+def envelope_error_code(env):
+    """错误码位置双形状:stdout 信封=顶层 `code`;stderr 错误信封=嵌套 `.error.code`。"""
+    if not isinstance(env, dict):
+        return None
+    if env.get("code") is not None:
+        return env.get("code")
+    err = env.get("error")
+    if isinstance(err, dict):
+        return err.get("code")
+    return None
+
+
+def envelope_error_msg(env):
+    if not isinstance(env, dict):
+        return ""
+    if env.get("msg"):
+        return str(env.get("msg"))
+    err = env.get("error")
+    if isinstance(err, dict) and err.get("message"):
+        return str(err.get("message"))
+    return ""
+
+
 def envelope_ok(env):
     return bool(env) and env.get("ok") is True
 

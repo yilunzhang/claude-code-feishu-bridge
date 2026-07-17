@@ -1,4 +1,5 @@
-"""小工具:id/nonce/marker/chunk/原子写/日志轮转。"""
+"""小工具:id/nonce/marker/chunk/原子写/日志轮转/短幂等键。"""
+import hashlib
 import json
 import os
 import secrets
@@ -17,6 +18,13 @@ def new_nonce():
 
 def marker_for(nonce):
     return f"{constants.MARKER_PREFIX}{nonce}]"
+
+
+def short_key(logical_key):
+    """E4b(真机 A/B):飞书 --idempotency-key(uuid 参数)上限 ~50 字符,超长报 99992402。
+    wire 短键 = 'fb:' + sha1(逻辑键)[:32],总长 35 ≤ 40(留余量);
+    确定性映射:同逻辑键 → 同短键(S4 同键重试语义保持);DB 仍存逻辑键(UNIQUE 语义不变)。"""
+    return "fb:" + hashlib.sha1(str(logical_key).encode("utf-8")).hexdigest()[:32]
 
 
 def chunk_text(s, limit=constants.CHUNK_LIMIT):

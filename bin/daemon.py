@@ -64,7 +64,7 @@ def main():
         db.set_state(conn, "last_loop_at", clock.wall_ms())
 
     inbound = Inbound(conn, cfg, runner, clock, paths.media_root(), heartbeat=heartbeat)
-    outbound = Outbound(conn, cfg, runner, clock, heartbeat=heartbeat)
+    outbound = Outbound(conn, cfg, runner, clock, heartbeat=heartbeat, log=log_line)
     approval = Approval(conn, cfg, clock, inbound=inbound)
     recovery = Recovery(conn, cfg, runner, clock, inbound, prober)
     core = DaemonCore(conn, cfg, clock, inbound, approval, outbound, recovery,

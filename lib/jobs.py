@@ -3,6 +3,14 @@
 from . import constants, texts, util
 
 
+# E4b 键模板最坏长度审计(逻辑键存 DB;wire 一律 util.short_key ≤40):
+#   turn:<32hex>:<idx>            = 38+len(idx)  → 大 idx 可超 50
+#   card:<32hex>                  = 37
+#   dec:<32hex>:<outcome≤8>       ≤ 46
+#   lc:<32hex>:<transition≤20>    ≤ 56  ← 超限
+#   rc:<int>                      小
+#   un:<message_id~35>            ≈ 38(message_id 长度不受我们控制)
+#   notice:<message_id~35>:<code≤14> ≈ 57  ← 超限
 def key_turn(turn_group, chunk_index):
     return f"turn:{turn_group}:{chunk_index}"
 

@@ -7,12 +7,13 @@ NOTICE_KINDS = ("decision_notice", "lifecycle_notice", "unsupported_notice", "in
 
 
 class Outbound:
-    def __init__(self, conn, cfg, runner, clock, heartbeat=None):
+    def __init__(self, conn, cfg, runner, clock, heartbeat=None, log=None):
         self.conn = conn
         self.cfg = cfg
         self.runner = runner
         self.clock = clock
         self.heartbeat = heartbeat  # r2-M1②:每次发送完 touch last_loop_at
+        self.log = log              # E4a 可观测性:unknown/failed 留原始 rc/stdout/stderr 现场
 
     # ------------------------------------------------------------------
     def startup_scan(self):
@@ -211,34 +212,52 @@ class Outbound:
             res = self.runner.run(
                 ["im", "reactions", "create", "--as", "bot", "--params", params,
                  "--data", data], timeout_s=constants.SEND_TIMEOUT_S)
-            env = runner_mod.parse_envelope(res.stdout)
+            env = runner_mod.parse_result(res)  # E4a:stderr 信封回退
             # 修复项9:成功必须解析出 .data.reaction_id(F10:缺字段=非成功)
             if res.rc == 0 and runner_mod.envelope_ok(env) \
                     and runner_mod.data_of(env).get("reaction_id"):
                 return ("sent", None)
+            self._log_failure(job, "failed", res)
             return ("failed", "reaction failed")  # 失败即 failed 不重试(4.5;S11 幂等)
+        wire_key = util.short_key(job["idempotency_key"])  # E4b:wire 一律短键(≤40)
         if kind == "approval_card":
             argv = ["im", "+messages-reply", "--as", "bot",
                     "--message-id", job["reply_to"], "--msg-type", "interactive",
                     "--content", job["body"] or "{}",
-                    "--idempotency-key", job["idempotency_key"]]
+                    "--idempotency-key", wire_key]
         else:
             argv = ["im", "+messages-send", "--as", "bot",
                     "--chat-id", job["chat_id"], "--text", job["body"] or "",
-                    "--idempotency-key", job["idempotency_key"]]
+                    "--idempotency-key", wire_key]
         res = self.runner.run(argv, timeout_s=constants.SEND_TIMEOUT_S)
-        env = runner_mod.parse_envelope(res.stdout)
+        env = runner_mod.parse_result(res)  # E4a:stdout → 空/不可解析回退 stderr
         if runner_mod.envelope_ok(env):
             mid = runner_mod.data_of(env).get("message_id")
             if mid:
                 return ("sent", mid)
+            self._log_failure(job, "unknown", res)
             return ("unknown", "ok-without-message_id")
-        if env is not None and env.get("ok") is False and env.get("code") is not None:
-            return (classify_error_code(env.get("code")),
-                    f"code={env.get('code')} {env.get('msg', '')}".strip())
+        code = runner_mod.envelope_error_code(env)  # 顶层 code / 嵌套 .error.code 双形状
+        if env is not None and env.get("ok") is False and code is not None:
+            outcome = classify_error_code(code)
+            self._log_failure(job, outcome, res)
+            return (outcome, f"code={code} {runner_mod.envelope_error_msg(env)}".strip())
+        self._log_failure(job, "unknown", res)
         if res.timed_out:
             return ("unknown", "timeout")
         return ("unknown", f"rc={res.rc} unparseable-envelope")
+
+    def _log_failure(self, job, outcome, res):
+        """E4a 可观测性:非 sent 结果把原始现场(rc/stdout/stderr 截断)记入 daemon.log。"""
+        if self.log is None:
+            return
+        try:
+            self.log(
+                f"send {job['kind']} key={job['idempotency_key']} -> {outcome}: "
+                f"rc={res.rc} timed_out={res.timed_out} "
+                f"stdout={(res.stdout or '')[:300]!r} stderr={(res.stderr or '')[:300]!r}")
+        except Exception:
+            pass
 
 
 def classify_error_code(code):

@@ -44,7 +44,9 @@ class TestSendContract:
         args, _ = env.runner.calls_matching("im", "+messages-send")[0]
         assert args[args.index("--chat-id") + 1] == CHAT
         assert args[args.index("--text") + 1] == "hello"
-        assert args[args.index("--idempotency-key") + 1] == "turn:g1:0"
+        from lib import util
+        wire_key = args[args.index("--idempotency-key") + 1]
+        assert wire_key == util.short_key("turn:g1:0") and len(wire_key) <= 40  # E4b
         assert "--markdown" not in args  # F6:出站禁用 markdown 主动面
 
     def test_missing_message_id_is_unknown_then_retry_same_key(self, env):
@@ -418,3 +420,102 @@ class TestReactionContract:
                ref_delivery_seq=seq, ref_message_id="om_1", body="GLANCE")
         env.outbound.tick()
         assert job_state(env, f"rc:{seq}")["state"] == "failed"
+
+
+class TestE4StderrEnvelope:
+    """E4a:错误信封在 stderr(stdout 空),code 嵌套 .error.code;分类照走永久/瞬态表。"""
+
+    def _job(self, env, key="turn:g:0"):
+        bid = env.make_binding(status="active")
+        return mk_job(env, binding_id=bid, key=key, turn_group="g", chunk_index=0)
+
+    def test_stderr_permanent_code_failed(self, env):
+        from tests.helpers import stderr_err_envelope
+        self._job(env)
+        env.runner.on_prefix(["im", "+messages-send"],
+                             lambda a, c: stderr_err_envelope(99992402))
+        env.outbound.tick()
+        row = job_state(env, "turn:g:0")
+        assert row["state"] == "failed" and "99992402" in row["error"]
+
+    def test_stderr_transient_code_unknown_with_retry(self, env):
+        from tests.helpers import stderr_err_envelope
+        self._job(env)
+        env.runner.on_prefix(["im", "+messages-send"],
+                             lambda a, c: stderr_err_envelope(230020, subtype="rate_limited",
+                                                              msg="req too frequent"))
+        env.outbound.tick()
+        row = job_state(env, "turn:g:0")
+        assert row["state"] == "unknown" and row["next_attempt_at"] is not None
+
+    def test_failure_logs_raw_streams(self, env):
+        """E4a 可观测性:unknown/failed 把 rc/stdout/stderr 截断记入 daemon.log。"""
+        from tests.helpers import stderr_err_envelope
+        logs = []
+        env.outbound.log = logs.append
+        self._job(env)
+        env.runner.on_prefix(["im", "+messages-send"],
+                             lambda a, c: stderr_err_envelope(99992402))
+        env.outbound.tick()
+        joined = "\n".join(logs)
+        assert "rc=" in joined and "99992402" in joined and "turn:g:0" in joined
+
+
+class TestE4ShortKey:
+    """E4b:飞书 uuid 参数上限 ~50 字符 → wire 短键 ≤40;DB 逻辑键与 UNIQUE 语义不变。"""
+
+    def test_short_key_properties(self):
+        from lib import util
+        k1 = util.short_key("notice:om_" + "a" * 40 + ":session_closed")
+        k2 = util.short_key("notice:om_" + "a" * 40 + ":session_closed")
+        k3 = util.short_key("notice:om_" + "b" * 40 + ":session_closed")
+        assert k1 == k2 and k1 != k3
+        assert len(k1) <= 40 and k1.startswith("fb:")
+
+    def test_long_logical_key_transmitted_as_short_key(self, env):
+        """真形状:fake 对 >50 字符 key 返回 99992402 stderr 信封,逼实现走短键。"""
+        from tests.helpers import stderr_err_envelope
+        from lib import util
+        long_mid = "om_" + "a" * 40
+        env.conn.execute(
+            "INSERT INTO inbox(event_id,message_id,chat_id,state,ts) VALUES('e1',?,?,?,0)",
+            (long_mid, CHAT, "session_closed"))
+        logical = f"notice:{long_mid}:session_closed"
+        assert len(logical) > 50  # 逻辑键必超限
+        mk_job(env, kind="inbound_notice", key=logical,
+               ref_message_id=long_mid, expected_state="session_closed", body="提示")
+        wire_keys = []
+
+        def fn(args, cwd):
+            key = args[args.index("--idempotency-key") + 1]
+            wire_keys.append(key)
+            if len(key) > 50:
+                return stderr_err_envelope(99992402)  # 真机行为:超长键被拒
+            return ok_envelope({"message_id": "om_ok"})
+
+        env.runner.on_prefix(["im", "+messages-send"], fn)
+        env.outbound.tick()
+        row = job_state(env, logical)
+        assert row["state"] == "sent"  # 走短键才可能成功
+        assert wire_keys == [util.short_key(logical)]
+        assert len(wire_keys[0]) <= 40
+        # DB 存逻辑键,UNIQUE 语义不变
+        assert row["idempotency_key"] == logical
+
+    def test_retry_uses_same_short_key(self, env):
+        from lib import util
+        bid = env.make_binding(status="active")
+        mk_job(env, binding_id=bid, key="turn:g:0", turn_group="g", chunk_index=0)
+        seen = []
+
+        def fn(args, cwd):
+            seen.append(args[args.index("--idempotency-key") + 1])
+            if len(seen) == 1:
+                return FakeRunResult(rc=1, stdout="", timed_out=True)
+            return ok_envelope({"message_id": "om_ok"})
+
+        env.runner.on_prefix(["im", "+messages-send"], fn)
+        env.outbound.tick()
+        env.clock.tick(constants.UNKNOWN_RETRY_DELAY_MS + 1)
+        env.outbound.tick()
+        assert seen[0] == seen[1] == util.short_key("turn:g:0")  # S4 同键重试语义保持
