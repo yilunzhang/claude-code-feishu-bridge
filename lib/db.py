@@ -21,6 +21,22 @@ def connect(db_file, busy_timeout_ms=constants.BUSY_TIMEOUT_DAEMON_MS):
     return conn
 
 
+def check_schema(conn):
+    """只读校验 schema_version —— **绝不建库、绝不写**(供 notify 直发等只读入口用)。
+    缺 daemon_state 表 / 缺 schema_version 行 / 值不符 → SchemaMismatch(fail-closed)。
+    与 init_schema 共用一份比对逻辑(后者建库后调用本函数)。"""
+    has = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='daemon_state'").fetchone()
+    if not has:
+        raise SchemaMismatch("bridge.db 未初始化(缺 daemon_state 表)")
+    ver = conn.execute(
+        "SELECT value FROM daemon_state WHERE key='schema_version'").fetchone()
+    if not ver or ver[0] != constants.SCHEMA_VERSION:
+        raise SchemaMismatch(
+            f"bridge.db schema_version={ver[0] if ver else None!r}, "
+            f"expected {constants.SCHEMA_VERSION!r}")
+
+
 def init_schema(conn, schema_file):
     """schema.sql 原样建库(仅当空库);随后核对 schema_version。"""
     has = conn.execute(
@@ -28,12 +44,7 @@ def init_schema(conn, schema_file):
     if not has:
         sql = open(schema_file, "r", encoding="utf-8").read()
         conn.executescript(sql)  # 一次性建库;sqlite 原生处理注释/分号
-    ver = conn.execute(
-        "SELECT value FROM daemon_state WHERE key='schema_version'").fetchone()
-    if not ver or ver[0] != constants.SCHEMA_VERSION:
-        raise SchemaMismatch(
-            f"bridge.db schema_version={ver[0] if ver else None!r}, "
-            f"expected {constants.SCHEMA_VERSION!r}")
+    check_schema(conn)  # 建库后表必存在;比对逻辑单一来源
 
 
 @contextlib.contextmanager

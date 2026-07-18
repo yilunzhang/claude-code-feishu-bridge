@@ -116,6 +116,20 @@ def envelope_error_code(env):
     return None
 
 
+def envelope_error_type(env):
+    """错误类型位置双形状(与 envelope_error_code 同构):顶层 `type` 或嵌套 `.error.type`。
+    notify 直发用它区分「本地 pre-API 失败(validation/config/authentication/authorization)=确定未发」
+    与「network/api/unknown=发送结果不确定」。无=None。"""
+    if not isinstance(env, dict):
+        return None
+    if env.get("type") is not None:
+        return env.get("type")
+    err = env.get("error")
+    if isinstance(err, dict):
+        return err.get("type")
+    return None
+
+
 def envelope_error_msg(env):
     if not isinstance(env, dict):
         return ""

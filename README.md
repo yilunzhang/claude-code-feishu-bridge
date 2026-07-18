@@ -21,7 +21,7 @@
   绑定 session(CC 实例)
 ```
 
-不变量(plan §2):未绑定 session 的输出绝不外发(含 bind turn 自身,fail-closed);投递判定零模型参与;一切外发经 outbound_jobs 由 daemon 发出;所有状态推进=带旧状态 CAS。
+不变量(plan §2):未绑定 session 的输出绝不外发(含 bind turn 自身,fail-closed);投递判定零模型参与;普通桥出站(每轮转发/审批卡/通知)经 outbound_jobs 由 daemon 单点发出,**notify skill 是受同款门控(allowlist+身份门+session 三元组)的显式直发例外**(见「notify 主动通知」);所有状态推进=带旧状态 CAS。
 
 ## 安装
 
@@ -84,6 +84,16 @@ bind 完整握手需要 CC 侧:起 persistent Monitor 跑 `bin/listener.py <bind
 - image/file 会下载到本地,payload 给绝对路径;member 附件批准前不下载。
 - 未绑定群 @bot → "未绑定"提示;绑定 session 已关 → "已关闭"提示(有冷却限速)。
 - 敏感操作前 `/feishu-bridge:bridge unbind`(立即生效),事后 rebind。
+
+## notify 主动通知(blocker → @群主)
+
+绑定后,session 里的 agent 撞到**需要 owner 决策/授权的 blocker**(需批准/选择/给密钥或权限/确认高风险操作)时,可主动调用 **notify skill** 给绑定群发一条 **@群主** 的通知(穿透免打扰),把待决事项推过去、请人来拍板——不用干等在终端。这是 daemon 单点出站之外**受门控的显式直发例外**。
+
+- 入口:`skills/notify/SKILL.md`(agent 主动触发);底座 `bin/notifyctl.py`。
+- 用法(消息经 stdin,避 shell 展开):Write 正文到临时文件 → `python3 <plugin根>/bin/notifyctl.py < 文件`。系统自动前缀 `<at user_id=owner></at>`;正文里字面 `<at` 会被拒(防误触发真实 @)。
+- **不是 fail-open**:发送失败/不确定**如实返回、不吞**。输出结构化 JSON,`sent` 为主信号——`true`=已通知(带 `message_id`);`false`+`reason`=确定未发(如实转述);`"unknown"`=可能已发,先看群别乱重试。只有前置条件(空正文/未绑定)才 exit 0。
+- **门控**(与普通桥出站同款,fail-closed):session 三元组(`session_id`∧`cc_pid`∧`cc_start`∧`active`)精确命中才发,绝不误发旧/别的 session;`chat_allowlist`;出站身份门 `outbound_gate`(缺行/非 ok 一律拒);owner_open_id 白名单校验(防 `@全员`/闭标签注入);chat_id 格式校验;完整 argv 编码门(NUL/孤立 surrogate/非 str 全拦)。**只读绑定,绝不改状态**。
+- **发送分类**对齐 lark-cli 错误契约:有 `message_id`=`sent:true`;`type:network`(HTTP 5xx 等)=`unknown`;其它业务错误码=`sent:false`(`retryable` 纯信官方 `error.retryable` 字段)。**已知限制**:`type:network` 无法区分"POST 已发出不确定"与"POST 没开始(如 token 获取失败,本可安全重试)"——lark-cli 信封不带失败阶段信息,取保守 `unknown`(最坏=看群后手动重发一次,绝不重复 @)。owner mention 用结构化 **post `at` 节点**(不受正文畸形标签影响,已真机验证 @ 生效)。
 
 ## 数据与文件
 

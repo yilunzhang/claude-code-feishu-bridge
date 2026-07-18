@@ -90,4 +90,4 @@ python3 "${CLAUDE_SKILL_DIR}/../../bin/bridgectl.py" status
 
 - 输出会进群:不要在回复里打印密钥/token/内网凭证;敏感操作前建议用户先 unbind。
 - 绑定期间**不要**在回复文本里输出形如 `[feishu-bridge-bind:...]` 的字符串(会被 fail-closed 抑制转发)。
-- 一切群侧外发都由 daemon 完成;你唯一主动发消息的场景是本 skill 明确列出的命令,别用 lark-cli 直接往群里发。
+- 普通群侧外发(每轮转发/审批卡/通知)都由 daemon 完成;唯一的主动直发例外 = feishu-bridge 的 **notify skill**(受 allowlist+身份门+session 三元组门控,给本 session 绑定群发 @群主 的 blocker 通知)。除本 skill 列出的命令与 notify 外,别用 lark-cli 直接往群里发。

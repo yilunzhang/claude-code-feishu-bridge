@@ -10,7 +10,7 @@
       "name": "feishu-bridge",
       "description": "把本地 Claude Code session 与飞书群一一绑定的 build-in-public 桥:群内 @bot 消息投递进 session,每轮最终输出自动转发回群;owner 消息直投,其他成员消息由 owner 点卡片审批。仅管群聊(chat_type=group)。",
       "source": "./",
-      "version": "1.1.0",
+      "version": "1.2.0",
       "category": "productivity",
       "tags": ["feishu", "lark", "bridge", "build-in-public", "messaging"],
       "homepage": "https://github.com/yilunzhang/claude-code-feishu-bridge",
