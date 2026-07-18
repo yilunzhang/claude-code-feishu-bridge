@@ -660,11 +660,16 @@ def test_stopping_phase_not_ready(env):
 
 def test_version_code_identity_str_no_git_stable():
     """coderev:code_identity = pkg_root|plugin_version(**删了 git 段**),两段、稳定。"""
+    import json
     from lib import version, paths
     ci = version.code_identity_str()
     parts = ci.split("|")
     assert len(parts) == 2                    # 无 git 段
     assert parts[0] == str(paths.pkg_root())  # resolve 后绝对路径
-    assert parts[1] == "1.0.0"                # 本 plugin.json version
+    # 版本段 = **独立**解析 plugin.json 的 version(不走 version.plugin_version() 免同义反复);
+    # 动态读避免每次 bump 手改硬编码而 rot(21c1089 bump 1.0.0→1.0.1 时本断言未更新即漏)。
+    expected_ver = json.loads(
+        (paths.pkg_root() / ".claude-plugin" / "plugin.json").read_text())["version"]
+    assert parts[1] == expected_ver           # code_identity 版本段 == plugin.json 实际 version
     assert version.code_identity_str() == ci  # 稳定(不含易变 git hash)
     assert not hasattr(version, "git_build")  # git 探测已删除

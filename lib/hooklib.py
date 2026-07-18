@@ -176,6 +176,17 @@ def run_stop_hook(payload, *, conn, prober, clock, start_pid=None):
     if not msg.strip():
         return {"suppressed": False, "reason": "empty-message"}
     chunks = util.chunk_text(msg, constants.CHUNK_LIMIT)
+    # 每轮转发页脚(context/model/effort)= best-effort 装饰,完全隔离于转发关键路径(fail-open 铁律):
+    #   延迟导入 → 即便 ctxmeter 损坏(如 3.9 导入错)也只丢页脚、不炸 hook(不在顶层 import,把导入面挡在关键路径外);
+    #   本地 try → import/计算/拼接任何异常都不冒泡到 stop_hook_entry 的 fail-closed 包装。
+    #   拼到 chunks[-1] → 页脚完整、只一次、落最大 index;(turn_group,chunk_index) 唯一索引不受影响。
+    try:
+        from . import ctxmeter
+        footer = ctxmeter.footer_for(payload)
+        if footer and chunks:
+            chunks[-1] = chunks[-1] + footer
+    except Exception:
+        pass                    # chunks 不变 → 原样转发
     group = util.new_id()
     with db.tx(conn):
         cur = conn.execute("SELECT status FROM bindings WHERE binding_id=?",
