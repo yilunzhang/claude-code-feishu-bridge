@@ -53,6 +53,15 @@ def stderr_err_envelope(code, subtype="invalid_parameters", msg="field validatio
             ensure_ascii=False))
 
 
+def network_err_envelope(code=503, retryable=True, subtype="server_error"):
+    """真机 503/网络类错误形状(daemon.log 实证):错误信封在 stderr,
+    error.type=network、error.retryable=true、error.code=5xx。"""
+    err = {"type": "network", "subtype": subtype, "code": code, "message": f"HTTP {code}: "}
+    if retryable is not None:
+        err["retryable"] = retryable
+    return FakeRunResult(4, "", json.dumps({"ok": False, "error": err}, ensure_ascii=False))
+
+
 class FakeRunner:
     """可注入 lark-cli runner。responders: list of (predicate(args)->bool, fn(args, cwd)->FakeRunResult)。
     未匹配调用默认抛 AssertionError(离线铁律:绝不静默放过未预期的外呼)。

@@ -130,6 +130,20 @@ def envelope_error_type(env):
     return None
 
 
+def envelope_error_retryable(env):
+    """`.error.retryable`(嵌套)或顶层 `retryable`;缺=None(未知)。lark-cli 官方稳定布尔字段,
+    false 常省略。出站 session_turn 用它区分「可持久重试(network/5xx/频控)」与「不宜重试」。
+    与 notifyctl._env_retryable 同构。"""
+    if not isinstance(env, dict):
+        return None
+    err = env.get("error")
+    if isinstance(err, dict) and "retryable" in err:
+        return err.get("retryable")
+    if "retryable" in env:
+        return env.get("retryable")
+    return None
+
+
 def envelope_error_msg(env):
     if not isinstance(env, dict):
         return ""

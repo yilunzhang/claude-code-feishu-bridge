@@ -44,8 +44,14 @@ SEND_TIMEOUT_S = 30
 MGET_TIMEOUT_S = 30
 DOWNLOAD_TIMEOUT_S = 120
 UNKNOWN_RETRY_DELAY_MS = 15_000
-MAX_SEND_ATTEMPTS = 2            # 首发 + unknown 同 key 自动重试一次(S4)
+MAX_SEND_ATTEMPTS = 2            # 首发 + unknown 同 key 自动重试一次(非 retryable / 非 session_turn)
 OUTBOUND_BATCH = 20
+# session_turn retryable 硬化(2026-07-18 事故根因修复):飞书后端 503/网络抖动窗可持续
+# 数分钟,而旧 15s 窗太薄 → 转发被静默丢弃 + 队头阻塞整群。发送带 idempotency-key(服务端
+# 去重)→ 可安全持久重试。仅 session_turn 生效;命名对齐 CARD_REARM_*;退避公式镜像 recovery.py。
+TURN_RETRYABLE_MAX_ATTEMPTS = 6       # 含首发;retryable session_turn 尝试上限(~2.4min 总窗)
+TURN_RETRY_BACKOFF_MS = 8_000         # 指数退避基数
+TURN_RETRY_BACKOFF_MAX_MS = 45_000    # 退避封顶
 
 # daemon 节奏
 RECOVERY_INTERVAL_MS = 60_000
@@ -97,6 +103,14 @@ TRANSIENT_SEND_CODES = frozenset({
     230020,    # 请求频控
     99991661,  # tenant access token 失效(CLI 自刷新)
     99991663,  # app access token 失效(CLI 自刷新)
+})
+
+# session_turn 持久重试的**无显式字段回退**允许集:仅当 lark-cli 未给出 error.retryable 时才用。
+# 只放官方明确可重试且值得持久退避的(频控);**故意不含 99991661/99991663 token 类** —— 官方
+# 契约标其不可重试(见 notify 契约),放进来会把认证失败当瞬态刷 6 次 + 误导告警(codex MAJOR-2)。
+# 有显式 error.retryable 时该字段优先,本集不参与(见 Outbound._is_retryable)。
+RETRYABLE_FALLBACK_CODES = frozenset({
+    230020,    # 请求频控
 })
 
 # approval_card 重臂(修复项3):failed → pending 退避重臂,总尝试上限

@@ -47,6 +47,16 @@ def decision_notice_body(outcome):
     return DECISION_NOTICE[outcome]
 
 
+def send_failure_alert_body():
+    """出站 session_turn 多次重试后放弃(转 failed 以放行后续)时的可见告警。固定文案(无注入面),
+    经 --markdown 发到绑定群,让"丢弃某条消息"不静默。
+    **诚实措辞(codex MAJOR-1)**:超时/网络类耗尽时其实**无法确认**原消息是否已达飞书,故不能断言
+    "未送达";补发是新消息(新幂等键),若原消息其实已达会重复 → 提示先查群再决定。"""
+    return ("⚠️ 有一条本会话消息经多次重试仍**未能确认送达**(飞书接口持续不可用),"
+            "已停止自动重试以免阻塞后续消息。请先查看群内是否已有该消息,再决定是否让我补发"
+            "(补发为新消息,若原消息其实已送达可能重复)。")
+
+
 # ---- bind 回复 banner(UX 提醒,非安全控制;plan 4.1.5 / §5)----
 BIND_BANNER = (
     "本 session 已进入 build-in-public 桥接:每轮最终输出会自动转发到绑定的飞书群。\n"

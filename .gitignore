@@ -1,3 +1,6 @@
 __pycache__/
 *.pyc
 .pytest_cache/
+
+# codex review prompts/outputs, spec drafts (agent scratch)
+scratch/
