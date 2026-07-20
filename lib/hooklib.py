@@ -1,7 +1,12 @@
-"""Stop / SessionEnd hook 核心(plan 4.7 / 4.1.6)。
-I5:hook 不联网,只读写 bridge.db(busy_timeout 有界);异常总则=统一抑制 +
-hook_drops.log 固定文案一行(不含正文)+ 计数镜像;双双不可写 → stderr 固定告警。"""
+"""Stop / SessionEnd / StopFailure hook 核心(plan 4.7 / 4.1.6)。
+I5:**Stop/SessionEnd hook 不联网,只读写 bridge.db**(busy_timeout 有界);异常总则=统一抑制 +
+hook_drops.log 固定文案一行(不含正文)+ 计数镜像;双双不可写 → stderr 固定告警。
+**例外:StopFailure hook 会联网**——一轮因 API 错误结束时,经 `lib.notify.run_notify`(受同款
+allowlist+身份门+session 三元组门控的直发)给绑定群发 @群主 告警(见 stop_failure_entry;fail-closed,
+exit 0,不写心跳)。"""
 import datetime
+import os
+import re
 import sqlite3
 import sys
 import time
@@ -280,3 +285,121 @@ def run_session_end(payload, *, conn, prober, clock, start_pid=None):
                 "UPDATE pending_bind SET latch_open=0 "
                 "WHERE cc_pid=? AND cc_start=? AND latch_open=1", (pid, lstart))
     return {"closed": closed}
+
+
+# ---------------------------------------------------------------- StopFailure(API 错误告警;联网例外)
+# 一轮因 API 错误(429 rate_limit / 529 overloaded / 5xx server_error / auth… 任意类型)结束时,CC 触发
+# StopFailure(与 Stop 互斥,每轮至多一次)。经 lib.notify.run_notify 给**本 session 绑定群**发一条
+# @群主 告警(结构化 at 节点,穿透免打扰),与 notify skill 同格式、同门控。未绑定 session 静默(如实
+# 不发)。**定位假设**:个人轻量工具、单用户、群内可信 → 告警正文含**有界的** error/error_details/cwd
+# 路径,发进可信群(非"零敏感";按可信群假设接受)。fail-closed:一切异常吞掉、exit 0,绝不阻塞 CC。
+
+_MAX_BODY_LEN = 800
+
+
+def _sanitize_field(val, cap):
+    """把一个动态字段净化成**可安全放进 post text 节点的单行文本**(R1-#4/R2-Low3)。
+    顺序关键:**先删毒字符(NUL/孤立 surrogate/其它控制符)、再中和 `<at`** —— 否则 `<\\x00at` /
+    `<\\ud800at` 删毒后会还原成 `<at`,漏过。步骤:
+      ① 删 NUL 与孤立 surrogate;CR/LF/Tab→空格;其它 C0/DEL 删。
+      ② 折叠连续空白为单空格 + strip(保证一行)。
+      ③ 中和 `<at`(大小写不敏感)→ `< at`,使 lib.notify.AT_RE 不命中 → 告警不被整条丢弃。
+      ④ 截断到 cap(留 `…`)。
+    结果**绝不含** NUL/换行/孤立 surrogate,且 AT_RE 不命中。"""
+    s = str(val)
+    chars = []
+    for ch in s:
+        o = ord(ch)
+        if o == 0 or 0xD800 <= o <= 0xDFFF:   # NUL / 孤立 surrogate → 删
+            continue
+        if ch in "\r\n\t":                     # 换行/制表 → 空格
+            chars.append(" ")
+            continue
+        if o < 0x20 or o == 0x7F:              # 其它 C0 控制符 / DEL → 删
+            continue
+        chars.append(ch)
+    s = re.sub(r"\s+", " ", "".join(chars)).strip()
+    s = re.sub(r"<at", "< at", s, flags=re.IGNORECASE)   # 中和(在删毒之后)
+    if len(s) > cap:
+        s = s[:cap - 1] + "…"
+    return s
+
+
+def compose_stop_failure_message(payload):
+    """据 StopFailure payload 拼一行诚实告警正文(纯函数)。含 error 类型 + 可选 error_details + cwd。
+    **不含 "已重试耗尽"**(用户选"所有错误类型",含非重试类如 auth/model-not-found)。@群主前缀由
+    run_notify 自动加(独立 at 节点),此处**只出正文**,且保证正文永不含 `<at`/NUL/换行(经 _sanitize_field)。"""
+    error = _sanitize_field(payload.get("error") or "unknown", 60) or "unknown"
+    body = "⚠️ 本会话有一轮因 API 错误结束:" + error
+    details = payload.get("error_details")
+    if details:
+        d = _sanitize_field(details, 200)
+        if d:
+            body += " — " + d
+    cwd = payload.get("cwd")
+    if cwd:
+        c = _sanitize_field(cwd, 200)
+        if c:
+            body += "。cwd: " + c
+    if len(body) > _MAX_BODY_LEN:            # 三段相加兜底
+        body = body[:_MAX_BODY_LEN - 1] + "…"
+    return body
+
+
+def run_stop_failure(payload, *, environ=None, prober=None, start_pid=None,
+                     notify_fn=None, make_runner=None):
+    """组装告警正文 + 只用 payload 的 session_id,经 run_notify 发到本 session 绑定群。→ 观测摘要 dict。
+    **env(R1-#2 关键)**:`os.environ if environ is None`(非 `or`,免 environ={} 回退)→ 拷贝 →
+    **先 pop 继承的 CLAUDE_CODE_SESSION_ID**(CC 会在 hook env 里设它;payload 缺 sid 时若留着继承值会
+    误发到当前绑定群)→ 仅当 payload 有合法 str sid 才注入。lib.notify 惰性导入(不扩 Stop/SessionEnd
+    的 import 面;notify 模块导入回归也不会拖垮既有 hooks)。"""
+    from . import notify, runner as runner_mod  # lazy import
+    sid = payload.get("session_id")
+    msg = compose_stop_failure_message(payload)
+    base = os.environ if environ is None else environ
+    env = dict(base)
+    env.pop("CLAUDE_CODE_SESSION_ID", None)
+    if isinstance(sid, str) and sid:
+        env["CLAUDE_CODE_SESSION_ID"] = sid
+    if notify_fn is None:
+        notify_fn = notify.run_notify
+    if prober is None:
+        prober = procs.SystemProber()
+    if make_runner is None:
+        def make_runner(p):
+            return runner_mod.LarkRunner(p)
+    if start_pid is None:
+        start_pid = os.getppid()
+    obj, _code = notify_fn(stdin_text=msg, environ=env, prober=prober,
+                           start_pid=start_pid, make_runner=make_runner)
+    return {"sent": obj.get("sent"), "reason": obj.get("reason")}
+
+
+def _log_stop_failure_outcome(res):
+    """观测:告警 sent≠true 时落 hook_drops.log 一行(**payload-free**,只含固定 reason 枚举;R2-Med1
+    诚实三态:sent==False→not-sent 确定未发;sent=='unknown'→delivery-unconfirmed 可能已发)。绝不 raise。"""
+    try:
+        sent = res.get("sent")
+        if sent is True:
+            return
+        label = "delivery-unconfirmed" if sent == "unknown" else "not-sent"
+        ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        util.append_log_line(
+            paths.hook_drops_path(),
+            "%s stop_failure alert %s sent=%r reason=%r" % (ts, label, sent, res.get("reason")))
+    except Exception:
+        pass
+
+
+def stop_failure_entry(payload, *, prober=None, start_pid=None, notify_fn=None, make_runner=None):
+    """StopFailure hook fail-closed 入口。**不写 hooks 心跳**:StopFailure 仅 API 错误时触发(罕见)、
+    非 hooks 生效的可靠信号;bind/preflight 只认 stop 心跳,paths.hook_heartbeat_path 也只接受
+    stop/session_end。一切异常 → _fail_closed_drop + 抑制(exit 0,绝不阻塞 CC)。"""
+    try:
+        res = run_stop_failure(payload, prober=prober, start_pid=start_pid,
+                               notify_fn=notify_fn, make_runner=make_runner)
+        _log_stop_failure_outcome(res)
+        return res
+    except Exception as e:
+        _fail_closed_drop(e, hook="stop_failure")
+        return {"suppressed": True, "reason": "exception"}

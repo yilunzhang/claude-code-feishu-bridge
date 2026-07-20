@@ -46,4 +46,4 @@ description: 遇到"需要 owner(群主)决策或授权才能继续"的 blocker 
 - 只对**本 session 用三元组(session_id + 进程实例 + active)精确命中的绑定**发;不会误发到别的 session 或旧绑定。
 - 发前尊重与普通桥出站同款的门:群 `chat_allowlist`、出站身份门(`outbound_gate`)。门不通=不发、如实返回。
 - 正文进群会被群成员看到:**不要把密钥/token/内网凭证写进通知正文**。
-- 这是 daemon 唯一发送者之外的**受门控显式直发例外**(仅此 notify + bind 相关命令);别用 `lark-cli` 直接往群里发。
+- 这是 daemon 唯一发送者之外的**受门控显式直发例外**之一(另一个是 StopFailure API 错误告警 hook,底座同为 `lib/notify.py`;加上 bind 相关命令);别用 `lark-cli` 直接往群里发。

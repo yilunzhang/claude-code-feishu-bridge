@@ -9,7 +9,7 @@ description: 把当前 Claude Code session 与一个飞书群一一绑定(build-
 
 ⚠️ **每条 Bash 命令都要内联完整路径** `"${CLAUDE_SKILL_DIR}/../../bin/bridgectl.py"` —— CC 每次 Bash 调用是独立进程,`BIN=...` 这类变量**不跨调用保存**,别设变量再引用。也**别 cd 到 plugin 根**(保持当前项目 cwd)。
 
-hooks(Stop/SessionEnd)由 plugin 的 `hooks/hooks.json` **自带**——安装 plugin 并重启 CC 即生效,**无需手改 settings.json**。
+hooks(Stop/SessionEnd/StopFailure)由 plugin 的 `hooks/hooks.json` **自带**——安装 plugin 并重启 CC 即生效,**无需手改 settings.json**。
 
 核心事实(影响你怎么做事):
 - **转发是自动的**:Stop hook 会把本 session 每 turn 的最终输出转发到绑定群。**绝不手工把最终答案再发一遍到群里**。
@@ -90,4 +90,4 @@ python3 "${CLAUDE_SKILL_DIR}/../../bin/bridgectl.py" status
 
 - 输出会进群:不要在回复里打印密钥/token/内网凭证;敏感操作前建议用户先 unbind。
 - 绑定期间**不要**在回复文本里输出形如 `[feishu-bridge-bind:...]` 的字符串(会被 fail-closed 抑制转发)。
-- 普通群侧外发(每轮转发/审批卡/通知)都由 daemon 完成;唯一的主动直发例外 = feishu-bridge 的 **notify skill**(受 allowlist+身份门+session 三元组门控,给本 session 绑定群发 @群主 的 blocker 通知)。除本 skill 列出的命令与 notify 外,别用 lark-cli 直接往群里发。
+- 普通群侧外发(每轮转发/审批卡/通知)都由 daemon 完成;主动直发例外有两个 = feishu-bridge 的 **notify skill**(blocker → @群主)与 **StopFailure hook**(一轮 API 错误 → @群主 告警),都受 allowlist+身份门+session 三元组门控、只发本 session 绑定群。除本 skill 列出的命令、notify 与该 hook 外,别用 lark-cli 直接往群里发。

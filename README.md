@@ -3,7 +3,7 @@
 设计:`~/csr/knowledge/feishu-bridge-plan.md` v7(七轮 codex 对抗评审收敛)。
 定位:build-in-public 桥。本地 CC session 与飞书群一一绑定;群内 @bot 消息投递进 session 作为指令;session 每 turn 最终输出自动转发回群。只管 `chat_type=group`(DM 桥 = `feishu-chat` skill)。
 
-**打包形态 = 标准 Claude Code plugin**:plugin 根含 `.claude-plugin/plugin.json`、`skills/bridge/SKILL.md`(自动发现)、`hooks/hooks.json`(Stop/SessionEnd,自动加载),以及 `bin/ lib/ schema.sql tests/`。安装 plugin 即自带 hooks——**不再需要手改 `settings.json`**。
+**打包形态 = 标准 Claude Code plugin**:plugin 根含 `.claude-plugin/plugin.json`、`skills/bridge/SKILL.md`(自动发现)、`hooks/hooks.json`(Stop/SessionEnd/StopFailure,自动加载),以及 `bin/ lib/ schema.sql tests/`。安装 plugin 即自带 hooks——**不再需要手改 `settings.json`**。
 
 ## 架构一图流
 
@@ -16,12 +16,12 @@
     审批:card.action.trigger 回调=单事务(去重+机械校验+CAS+入队/物化+通知)
     出站:outbound_jobs per-kind 守卫线性化→argv 发送→契约解析(唯一发送进程)
     存活:cc_gone / listener 心跳租约 两条独立 CAS;恢复工人驱动一切非终态
-              ▲ hooks 只写库(零网络):Stop / SessionEnd
+              ▲ hooks:Stop/SessionEnd 只写库(零网络);StopFailure 联网(API 错误 → @群主 告警)
               ▼ listener 领取(epoch 排他+lease),print 到 persistent Monitor stdout
   绑定 session(CC 实例)
 ```
 
-不变量(plan §2):未绑定 session 的输出绝不外发(含 bind turn 自身,fail-closed);投递判定零模型参与;普通桥出站(每轮转发/审批卡/通知)经 outbound_jobs 由 daemon 单点发出,**notify skill 是受同款门控(allowlist+身份门+session 三元组)的显式直发例外**(见「notify 主动通知」);所有状态推进=带旧状态 CAS。
+不变量(plan §2):未绑定 session 的输出绝不外发(含 bind turn 自身,fail-closed);投递判定零模型参与;普通桥出站(每轮转发/审批卡/通知)经 outbound_jobs 由 daemon 单点发出,**notify skill 与 StopFailure 告警 hook 是受同款门控(allowlist+身份门+session 三元组)的两个显式直发例外**(见「notify 主动通知」「StopFailure API 错误告警」);所有状态推进=带旧状态 CAS。
 
 ## 安装
 
@@ -95,6 +95,18 @@ bind 完整握手需要 CC 侧:起 persistent Monitor 跑 `bin/listener.py <bind
 - **门控**(与普通桥出站同款,fail-closed):session 三元组(`session_id`∧`cc_pid`∧`cc_start`∧`active`)精确命中才发,绝不误发旧/别的 session;`chat_allowlist`;出站身份门 `outbound_gate`(缺行/非 ok 一律拒);owner_open_id 白名单校验(防 `@全员`/闭标签注入);chat_id 格式校验;完整 argv 编码门(NUL/孤立 surrogate/非 str 全拦)。**只读绑定,绝不改状态**。
 - **发送分类**对齐 lark-cli 错误契约:有 `message_id`=`sent:true`;`type:network`(HTTP 5xx 等)=`unknown`;其它业务错误码=`sent:false`(`retryable` 纯信官方 `error.retryable` 字段)。**已知限制**:`type:network` 无法区分"POST 已发出不确定"与"POST 没开始(如 token 获取失败,本可安全重试)"——lark-cli 信封不带失败阶段信息,取保守 `unknown`(最坏=看群后手动重发一次,绝不重复 @)。owner mention 用结构化 **post `at` 节点**(不受正文畸形标签影响,已真机验证 @ 生效)。
 
+## StopFailure API 错误告警(一轮 API 错误 → @群主)
+
+绑定后,本 session 若有**一轮因 API 错误结束**(429 限频 / 529 过载 / 5xx 服务端 / 鉴权 / 计费等**任意类型**;CC 的 `StopFailure` hook 触发,与正常 `Stop` 互斥、每轮至多一次),会自动给绑定群发一条 **@群主** 告警(结构化 `at` 节点,穿透免打扰),正文含错误类型 + 可选 `error_details` + `cwd`。这是 daemon 单点出站之外的**第二个受同款门控的显式直发例外**,复用 `lib/notify.py::run_notify`(与 notify skill 同路径、同门控)。
+
+- **无需配置**:随 plugin 自带(`hooks/hooks.json` 的 `StopFailure` 条目,**无 matcher = 所有 API 错误类型都发**);装 plugin + 重启 CC 即生效。想只收某几类,给该条目加 matcher(如 `"rate_limit|overloaded|server_error"`,精确匹配、`|` 分隔)。
+- **仅绑定 session**:只发本 session 三元组精确命中的绑定群、@群主;未绑定 session 静默(如实不发)。**只用 payload 的 `session_id`**(清掉继承的 `CLAUDE_CODE_SESSION_ID` 再按需注入,防误发)。
+- **fail-closed**:hook 永远 exit 0、绝不阻塞 CC;一切异常吞掉。`timeout: 60`(覆盖内部发送路径 ~40s;别用 Stop/SessionEnd 的 15s)。
+- **无去重**:后端过载窗内每轮失败各发一条(个人轻量工具,可接受)。
+- **诚实观测**:告警未确认送达时落 `hook_drops.log` 一行(payload-free:`not-sent`=确定未发 / `delivery-unconfirmed`=可能已发)。
+- **无心跳哨兵**:StopFailure 罕发,不作 hooks 生效信号(bind/preflight 只认 Stop 心跳)。
+- **正文进可信群**:含**有界的** error/error_details/cwd 路径(按"群内可信"假设;正文经净化,永不含 `<at`/NUL/换行,不会误触发 @全员)。
+
 ## 数据与文件
 
 | 路径 | 内容 |
@@ -103,11 +115,11 @@ bind 完整握手需要 CC 侧:起 persistent Monitor 跑 `bin/listener.py <bind
 | ├ `bridge.db` | SQLite WAL,唯一持久真相(schema 见 `schema.sql`) |
 | ├ `config.json` | 指纹:profile/app_id/bot_open_id/owner_open_id/cli_version(钉死) |
 | ├ `bridge.lock` | daemon flock 单例锁 |
-| ├ `hook_heartbeat.stop` / `.session_end` | plugin hooks 生效哨兵(各 event 分开;记 event/墙钟 ms/plugin 版本/pkg_root;preflight/bind 据此 advisory 判 hooks 是否已加载,不做安全判定) |
-| ├ `daemon.log` / `hook_drops.log` | daemon 日志 / hook fail-closed 丢弃记录(轮转,无正文) |
+| ├ `hook_heartbeat.stop` / `.session_end` | plugin hooks 生效哨兵(各 event 分开;记 event/墙钟 ms/plugin 版本/pkg_root;preflight/bind 据此 advisory 判 hooks 是否已加载,不做安全判定)。**StopFailure 无心跳**(罕发,非 liveness 信号) |
+| ├ `daemon.log` / `hook_drops.log` | daemon 日志 / hook fail-closed 丢弃记录 + StopFailure 告警未送达观测行(轮转,无正文) |
 | └ `media/<binding>/<message>/` | 附件物化(原子 rename;终态消息 7 天后清理) |
 
-代码在 **plugin 根**下:`.claude-plugin/plugin.json`(清单)· `skills/bridge/SKILL.md`(自动发现)· `hooks/hooks.json`(自动加载)+ `hooks/stop_hook.py`/`session_end.py`(只写库)· `bin/daemon.py`(守护进程)· `bin/listener.py`(Monitor 内)· `bin/bridgectl.py`(CLI)· `lib/*`(核心逻辑)· `schema.sql` · `tests/`。所有 Python 自定位靠 `Path(__file__).resolve().parents[1]` = plugin 根(bin/lib/hooks 均直接位于根下)。
+代码在 **plugin 根**下:`.claude-plugin/plugin.json`(清单)· `skills/bridge/SKILL.md`(自动发现)· `hooks/hooks.json`(自动加载)+ `hooks/stop_hook.py`/`session_end.py`(只写库)/`stop_failure_hook.py`(联网发 @群主 告警)· `bin/daemon.py`(守护进程)· `bin/listener.py`(Monitor 内)· `bin/bridgectl.py`(CLI)· `lib/*`(核心逻辑)· `schema.sql` · `tests/`。所有 Python 自定位靠 `Path(__file__).resolve().parents[1]` = plugin 根(bin/lib/hooks 均直接位于根下)。
 
 ## 测试
 
