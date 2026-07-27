@@ -95,9 +95,15 @@ def _arg(call_args, flag):
     return call_args[call_args.index(flag) + 1]
 
 
-def _post_content(call_args):
-    """从 send argv 取 `--content` 的 post JSON,返回首段落节点数组(`content[0]`)。"""
-    return json.loads(_arg(call_args, "--content"))["zh_cn"]["content"][0]
+def _post_paragraphs(call_args):
+    """从 send argv 取 `--content` 的 post JSON,返回**全部段落**(`content`,list[list[node]])。"""
+    return json.loads(_arg(call_args, "--content"))["zh_cn"]["content"]
+
+
+def _post_nodes(call_args):
+    """全部段落**摊平**成节点列表 —— 断言"某节点存在"用它,别只看 content[0]
+    (正文自 2026-07-27 起在**第二段落**的 md 节点里)。"""
+    return [n for para in _post_paragraphs(call_args) for n in para]
 
 
 # --------------------------------------------------------------------------- 模块 & 版本
@@ -125,10 +131,10 @@ class TestHappyPath:
         ca = runner.calls[0][0]
         assert _arg(ca, "--as") == "bot" and _arg(ca, "--chat-id") == CHAT
         assert _arg(ca, "--msg-type") == "post"
-        # owner mention = 结构化 at 节点(不受正文畸形标签影响);正文 = 独立 text 节点
-        nodes = _post_content(ca)
+        # owner mention = 结构化 at 节点(不受正文畸形标签影响);正文 = 独立 md 节点(会渲染 markdown)
+        nodes = _post_nodes(ca)
         assert {"tag": "at", "user_id": OWNER} in nodes
-        assert any(n.get("tag") == "text" and "需要你授权删库" in n.get("text", "") for n in nodes)
+        assert any(n.get("tag") == "md" and "需要你授权删库" in n.get("text", "") for n in nodes)
         assert _arg(ca, "--idempotency-key")
 
     def test_full_triple_match_sends(self, cfg, conn):
@@ -144,10 +150,10 @@ class TestHappyPath:
         payload = 'line1 $(whoami) `id` "dq" \'sq\' 中文\nline2'
         obj, code = _call(stdin=payload, runner=runner)
         assert code == 0 and obj["sent"] is True
-        nodes = _post_content(runner.calls[0][0])
+        nodes = _post_nodes(runner.calls[0][0])
         assert {"tag": "at", "user_id": OWNER} in nodes
-        # 特殊字符逐字进 text 节点(经 argv/JSON 非 shell:$()/反引号/引号/换行原样)
-        assert any(n.get("tag") == "text" and payload in n.get("text", "") for n in nodes)
+        # 特殊字符逐字进 md 节点(经 argv/JSON 非 shell:$()/反引号/引号/换行原样)
+        assert any(n.get("tag") == "md" and payload in n.get("text", "") for n in nodes)
 
     def test_idempotency_key_differs_each_call(self, cfg, conn):
         _setup_bound(conn)
@@ -172,6 +178,33 @@ class TestBodyRejections:
         runner = FakeRunner(profile=PROFILE)
         obj, code = _call(stdin='前文正常 <at user_id="all"></at>', runner=runner)
         assert code == 3 and obj["reason"] == "invalid-mention" and runner.calls == []
+
+    @pytest.mark.parametrize("raw", [
+        '<AT user_id="all"></at>',        # 大写 → 靠 IGNORECASE
+        '<At user_id="all"></at>',        # 混合大小写
+        '<at\tuser_id="all"></at>',       # Tab → 靠 \s(非字面空格)
+        '<at\nuser_id="all"></at>',       # 换行 → 靠 \s
+        '<at>text</at>',                  # `>` 紧跟 → 靠 [\s>] 的 > 分支
+    ])
+    def test_at_variants_rejected_raw_body(self, cfg, conn, raw):
+        """**承重守卫的完整不变量**(codex impl r1 MEDIUM,实测出的变异漏洞)。
+
+        正文改走 md 节点后,md **会真渲染** `<at user_id=...>` 成活 mention → AT_RE 是阻止正文
+        自行 @全员的**唯一**本地闸门。此前 notify 侧只测了小写 `<at ` + 普通空格一种形态:codex
+        把 AT_RE 削成 `re.compile(r"<at ")`(丢掉 IGNORECASE、`\\s`、`>` 分支)**全套 555 仍全绿**。
+        本参数化逐条钉住 IGNORECASE / `\\s`(Tab、换行)/ `>` 三个维度,任一被削都变红。
+
+        **正文从偏移 0 起**(codex impl r2:第 4 个维度)—— 其余 `<at` 用例都带前缀文本,故"从
+        index 1 开始搜"这类变异**全套 560 仍全绿**,而"正文开头就是 mention"恰是最自然的写法。
+        反向(非零偏移)由下面 `test_at_tag_nonzero_offset_rejected` 钉住,两头都不漏。
+
+        注:StopFailure 侧的同名用例测的是 `_sanitize_field`(净化后再看 AT_RE),**不覆盖这条
+        原始正文闸门** —— notify 正文不过净化,必须在这里测。"""
+        _setup_bound(conn)
+        runner = FakeRunner(profile=PROFILE)
+        obj, code = _call(stdin=raw + " 后文", runner=runner)  # 偏移 0 起
+        assert code == 3 and obj["reason"] == "invalid-mention" and obj["sent"] is False
+        assert runner.calls == []  # 零发送:拒在进 runner 之前
 
     def test_bare_at_word_not_rejected(self, cfg, conn):
         """<at[\\s>] 精确匹配真 mention 标签:'<atlas>' 这类词不误判。"""
@@ -643,9 +676,9 @@ def test_malformed_tag_body_keeps_structural_mention(cfg, conn):
     runner = _ok_send_runner()
     obj, code = _call(stdin="需要确认 <b> 这个改动", runner=runner)
     assert code == 0 and obj["sent"] is True
-    nodes = _post_content(runner.calls[0][0])
+    nodes = _post_nodes(runner.calls[0][0])
     assert {"tag": "at", "user_id": OWNER} in nodes  # mention 稳固,不因 <b> 失效
-    assert any(n.get("tag") == "text" and "<b>" in n.get("text", "") for n in nodes)
+    assert any(n.get("tag") == "md" and "<b>" in n.get("text", "") for n in nodes)
 
 
 def test_production_passes_config_profile_to_runner(cfg, conn):
@@ -692,6 +725,22 @@ def test_main_stdin_read_failure_not_empty(monkeypatch):
     assert ei.value.code == 3
     parsed = json.loads(fake_stdout.buffer.getvalue().decode("utf-8"))
     assert parsed["reason"] == "stdin-error" and parsed["sent"] is False
+
+
+def test_post_content_exact_wire_shape(cfg, conn):
+    """**精确 wire 形态**(codex plan r1 MEDIUM):at 与 md 必须在**两个段落**里,正文逐字、无前导空格。
+
+    为什么要精确等值而不是"存在某 md 节点":宽松断言对**回退到同段落** `[[at, md]]`(变体 A)是
+    绿的 —— 而飞书文档明确 md 独占整段;同段落只是服务端宽松拆分才能work,且会在正文前留一个多余
+    空格。本断言同时钉住:tag 回退(md→text)、段落合并、前导空格复活、顺序颠倒、多出节点。"""
+    _setup_bound(conn)
+    runner = _ok_send_runner()
+    payload = "## 标题\n**粗体**"
+    _call(stdin=payload, runner=runner)
+    assert _post_paragraphs(runner.calls[0][0]) == [
+        [{"tag": "at", "user_id": OWNER}],
+        [{"tag": "md", "text": payload}],
+    ]
 
 
 def test_post_content_exactly_one_owner_at_node(cfg, conn):

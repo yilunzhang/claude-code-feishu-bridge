@@ -298,7 +298,14 @@ _MAX_BODY_LEN = 800
 
 
 def _sanitize_field(val, cap):
-    """把一个动态字段净化成**可安全放进 post text 节点的单行文本**(R1-#4/R2-Low3)。
+    """把一个动态字段净化成**可安全放进 post md 节点的单行文本**(R1-#4/R2-Low3)。
+    注(2026-07-27 正文由 text 节点改 md 节点):净化后的字段进的是 **markdown 源** → 其中的
+    `*`/`_`/`` ` ``/`[]()`/裸 URL 会被渲染(cwd 里 `/a_b_c` 的下划线变斜体;URL 变**可点链接**)。
+    **有意不加转义层**(codex impl r1 Low 校正):① 本条已折叠换行 → 动态值造不出标题/列表/围栏/
+    表格等块级结构,影响限于内联;② 这些字段来自 CC 的 StopFailure payload(本机错误类型/详情/cwd),
+    非外部输入,个人轻量工具 + 群内可信 → 渲染跑偏可接受。**安全性质由步③ 的 `<at` 中和保证**
+    (md 会真渲染 mention);md 的图片只认已上传 image key、不认 URL,故无从本机抓取的面。
+    (本函数**只作用于 StopFailure 的动态字段**;notify skill 的正文不过这里,其 markdown 是有意的。)
     顺序关键:**先删毒字符(NUL/孤立 surrogate/其它控制符)、再中和 `<at`** —— 否则 `<\\x00at` /
     `<\\ud800at` 删毒后会还原成 `<at`,漏过。步骤:
       ① 删 NUL 与孤立 surrogate;CR/LF/Tab→空格;其它 C0/DEL 删。

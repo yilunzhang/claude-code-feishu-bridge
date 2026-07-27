@@ -94,10 +94,11 @@ bind 完整握手需要 CC 侧:起 persistent Monitor 跑 `bin/listener.py <bind
 - **不是 fail-open**:发送失败/不确定**如实返回、不吞**。输出结构化 JSON,`sent` 为主信号——`true`=已通知(带 `message_id`);`false`+`reason`=确定未发(如实转述);`"unknown"`=可能已发,先看群别乱重试。只有前置条件(空正文/未绑定)才 exit 0。
 - **门控**(与普通桥出站同款,fail-closed):session 三元组(`session_id`∧`cc_pid`∧`cc_start`∧`active`)精确命中才发,绝不误发旧/别的 session;`chat_allowlist`;出站身份门 `outbound_gate`(缺行/非 ok 一律拒);owner_open_id 白名单校验(防 `@全员`/闭标签注入);chat_id 格式校验;完整 argv 编码门(NUL/孤立 surrogate/非 str 全拦)。**只读绑定,绝不改状态**。
 - **发送分类**对齐 lark-cli 错误契约:有 `message_id`=`sent:true`;`type:network`(HTTP 5xx 等)=`unknown`;其它业务错误码=`sent:false`(`retryable` 纯信官方 `error.retryable` 字段)。**已知限制**:`type:network` 无法区分"POST 已发出不确定"与"POST 没开始(如 token 获取失败,本可安全重试)"——lark-cli 信封不带失败阶段信息,取保守 `unknown`(最坏=看群后手动重发一次,绝不重复 @)。owner mention 用结构化 **post `at` 节点**(不受正文畸形标签影响,已真机验证 @ 生效)。
+- **正文 markdown 会渲染**(v1.4.1 修):wire 形态 = 两个段落 —— `[[at 节点], [md 节点]]`(飞书 `md` 标签独占整段)。此前正文走 post `text` 节点=字面文本,markdown 不渲染,与每轮转发(`--markdown`)观感不一致。**注**:md 会真渲染 `<at user_id=...>` 成活 mention,故正文里字面 `<at` 的拒绝是**承重守卫**(阻止正文自行 @全员)、别删;md 图片只认已上传的 image key(不认 URL)→ **不引入** `--markdown` 那条从本机抓图的 SSRF 面。
 
 ## StopFailure API 错误告警(一轮 API 错误 → @群主)
 
-绑定后,本 session 若有**一轮因 API 错误结束**(429 限频 / 529 过载 / 5xx 服务端 / 鉴权 / 计费等**任意类型**;CC 的 `StopFailure` hook 触发,与正常 `Stop` 互斥、每轮至多一次),会自动给绑定群发一条 **@群主** 告警(结构化 `at` 节点,穿透免打扰),正文含错误类型 + 可选 `error_details` + `cwd`。这是 daemon 单点出站之外的**第二个受同款门控的显式直发例外**,复用 `lib/notify.py::run_notify`(与 notify skill 同路径、同门控)。
+绑定后,本 session 若有**一轮因 API 错误结束**(429 限频 / 529 过载 / 5xx 服务端 / 鉴权 / 计费等**任意类型**;CC 的 `StopFailure` hook 触发,与正常 `Stop` 互斥、每轮至多一次),会自动给绑定群发一条 **@群主** 告警(结构化 `at` 节点,穿透免打扰;正文走 `md` 节点、markdown 渲染),正文含错误类型 + 可选 `error_details` + `cwd`。这是 daemon 单点出站之外的**第二个受同款门控的显式直发例外**,复用 `lib/notify.py::run_notify`(与 notify skill 同路径、同门控)。
 
 - **无需配置**:随 plugin 自带(`hooks/hooks.json` 的 `StopFailure` 条目,**无 matcher = 所有 API 错误类型都发**);装 plugin + 重启 CC 即生效。想只收某几类,给该条目加 matcher(如 `"rate_limit|overloaded|server_error"`,精确匹配、`|` 分隔)。
 - **仅绑定 session**:只发本 session 三元组精确命中的绑定群、@群主;未绑定 session 静默(如实不发)。**只用 payload 的 `session_id`**(清掉继承的 `CLAUDE_CODE_SESSION_ID` 再按需注入,防误发)。

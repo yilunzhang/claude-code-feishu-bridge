@@ -36,12 +36,25 @@ def _post_content(owner, msg):
     """结构化 post content(codex impl MAJOR2):owner mention = **独立 at 节点**
     `{"tag":"at","user_id":owner}` —— 永远是真 mention,**不受正文畸形标签(如 `<b>`)影响**
     (旧 `--text` 里 `<at>前缀 + 正文` 会被畸形标签整段按原文渲染、mention 失效却仍返回 message_id)。
-    正文 = 独立 **text 节点**(字面文本)。注:post 的 text 节点仍会**内联正规化** `<at>` →
-    正文里的字面 `<at` 已在步1(AT_RE)拒绝,故 text 节点不会凭空多出 mention。"""
-    return {"zh_cn": {"content": [[
-        {"tag": "at", "user_id": owner},
-        {"tag": "text", "text": " " + msg},
-    ]]}}
+
+    正文 = 独立 **md 节点**(2026-07-27 修 bug:旧 `text` 节点是**字面文本**,markdown 不渲染 ——
+    turn 转发走 `--markdown` 能渲染,而 notify/StopFailure 走 post `text` 节点不能,两条出站路径
+    观感不一致;owner 看到的是生的 `## 标题` / `**粗体**`)。
+
+    **两个段落**(外层 list 两个元素)而非同一段落:飞书文档明确 `md` 标签"独占整段、不能与其它
+    标签同行"。实测同段落(at+md 并列)服务端也会把 mention 拆到自己一行、渲染正常,但那是依赖
+    宽松的服务端拆分行为;按文档取两段落的显式形态,且不会像同段落那样在正文前留一个多余空格。
+
+    **安全**(与 `text` 节点相比新增的面,均已覆盖):md 会**真的渲染** `<at user_id=...>` 成活
+    mention(text 节点不会),故正文里字面 `<at` 的拒绝(步1 AT_RE)从"防内联正规化"升级为**承重
+    守卫**——它是阻止正文自行 @全员的唯一闸门,别删。md 的图片语法只认**已上传的 image key**
+    (`![](img_v3_xxx)`),不认 URL,故**不引入 lark-cli `--markdown` 那条从本机抓 URL 图片的
+    SSRF 面**(那条是 turn 转发路径的已知取舍,见 outbound.py)。链接/自动链接会变成可点链接
+    (渲染面,非抓取面)。正文来源=本机 agent/hook(可信主体),群内可信 → 接受。"""
+    return {"zh_cn": {"content": [
+        [{"tag": "at", "user_id": owner}],
+        [{"tag": "md", "text": msg}],
+    ]}}
 
 
 def _wire_argv(profile, chat_id, owner, msg, wire_key):
@@ -203,7 +216,7 @@ def run_notify(*, stdin_text, environ, prober, start_pid, make_runner):
             wire_key = util.short_key(util.new_id())  # 每次新幂等键
 
             # 8d. 完整 argv 编码门(总兜底:NUL/孤立 surrogate/非 str 都会在 Popen 启动前抛,非 res.exc)。
-            #     owner 结构化进 at 节点、msg 进 text 节点(见 _post_content),整体在 content_json 里一并校验。
+            #     owner 结构化进 at 节点、msg 进 md 节点(见 _post_content),整体在 content_json 里一并校验。
             send_args, full_argv = _wire_argv(profile, chat_id, owner, msg, wire_key)
             for e in full_argv:
                 if not isinstance(e, str) or "\x00" in e:
