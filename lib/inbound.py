@@ -77,6 +77,19 @@ def extract_text(snap, app_id=None):
     return t
 
 
+def _media_keys(text):
+    """从已渲染正文提取附件句柄 → [{key,type}],**保序去重**。
+    key 前缀定 type(`img_*`→image、`file_*`→file),与飞书资源 API 契约一致。"""
+    out, seen = [], set()
+    for m in constants.MEDIA_KEY_RE.finditer(text or ""):
+        k = m.group(0)
+        if k in seen:
+            continue
+        seen.add(k)
+        out.append({"key": k, "type": "image" if k.startswith("img_") else "file"})
+    return out
+
+
 def trim_snapshot(snap):
     return util.jdumps({"msg_type": snap.get("msg_type"), "trimmed": True,
                         "sender": snap.get("sender"),
@@ -376,6 +389,24 @@ class Inbound:
             "text": extract_text(snap, self.cfg.get("app_id")),
             "media_paths": media_paths or [],
         }
+        # 非纯文本 → 附「附件可自取」句柄。**判定看 msg_type,不看正文有没有 key**:
+        # 「扫到 key 才加」会漏掉 image/file(它们渲染成 `[图片]`/`(文件) 名字`、根本不含 key),
+        # 也会给纯文本里粘了 img_v3_… 的代码误加。keys 独立填(可为空,空则给 mget 兜底)。
+        # 新字段而非拼进 text:text 是用户原话,污染它会混淆「用户说了什么」与「系统提示」;
+        # 新字段对既有消费者 additive,经 listener 的 line.update(payload) 原样到达 agent。
+        # **只扫未剥 mention 的原始顶层 `content`;拿不到就不扫**(codex impl r1 Low1 + r2 实证):
+        # `extract_text` 把指向本 bot 的 `@name` 替换成**空串**,故 `img@TestBot_v12_fake` 会被
+        # 拼成正文里原本不存在的 key `img_v12_fake`(实测,legacy `body.content` 形状同样复现)。
+        # 后果仅是 agent 拿到假 key、下载失败(charset 无 `/`/`.`/shell 元字符,无安全面),但
+        # 没必要留着。**故意不回退扫 `payload["text"]`**(那会让假 key 在 legacy 形状上复活),
+        # 也不去扫序列化后的 `body.content`(JSON 的字段名/转义会带来新误判面)。
+        # **代价**:legacy 形状(顶层 `content` 缺失,lark-cli 正常渲染下不出现)keys 为空 —— 但
+        # hint 仍在 + 给 mget 兜底,agent 照样能看原始结构。不递归解析原始 post 节点(过度设计)。
+        if snap.get("msg_type") != "text":
+            raw = snap.get("content")
+            keys = _media_keys(raw) if isinstance(raw, str) else []
+            payload["media_keys"] = keys
+            payload["fetch_hint"] = texts.media_fetch_hint(mid, keys, self.cfg["profile"])
         existing = self.conn.execute(
             "SELECT delivery_seq FROM deliveries WHERE binding_id=? AND message_id=?",
             (binding["binding_id"], mid)).fetchone()

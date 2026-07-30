@@ -74,10 +74,16 @@ class TestActivationRegate:
         env.inbound.drive_waiting_rows()
         d = env.deliveries(bid)
         assert len(d) == 1
-        paths = json.loads(d[0]["payload_json"])["media_paths"]
+        payload = json.loads(d[0]["payload_json"])
+        paths = payload["media_paths"]
         assert len(paths) == 1 and paths[0].endswith("pic.png")
         import os
         assert os.path.isabs(paths[0]) and os.path.exists(paths[0])
+        # v1.4.2:非文本一律带 hint 字段(**真投递路径**上钉住"所有非文本",
+        # 否则把闸门改成 `msg_type == "post"` 全套仍绿)。image 已下好 → keys 空、
+        # 但 hint 在,且措辞必须先指向 media_paths(不能谎称桥不下载)。
+        assert payload["media_keys"] == []
+        assert "media_paths" in payload["fetch_hint"]
 
 
 class TestExactlyOnePath:

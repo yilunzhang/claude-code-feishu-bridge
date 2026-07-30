@@ -1,4 +1,5 @@
 """feishu-bridge 常量(plan v7)。时间单位一律 ms,除非后缀 _S。"""
+import re
 
 # 出站 chunk 阈值(S9:20k CJK 单条 OK,阈值取 12000 字符)
 CHUNK_LIMIT = 12000
@@ -120,3 +121,12 @@ CARD_REARM_BACKOFF_MAX_MS = 10 * 60 * 1000
 
 SUPPORTED_MSG_TYPES = ("text", "image", "file", "post")
 MEDIA_MSG_TYPES = ("image", "file")
+
+# 附件句柄(image_key / file_key)—— 从正文里认出可自取的资源 key。
+# 形如 `img_v3_02143_6ea09006-e575-47a2-89e7-4a683ace737g`(真机实测),也有不带版本号的
+# `img_…`/`file_…`。**故意放宽**:**漏判会重现原 bug(agent 看不见附件),误判只是多一条
+# 取不到的提示** —— 不对称,往宽取。故**不写 `(?:v\d+_)?` 那样的版本号组** —— 它匹配的字符
+# 全在后面的宽字符类里 = 死重,留着只会让人误以为它在钉版本号格式(codex impl r2 实证:
+# 把 `v\d+` 削成 `v\d` 全套仍绿,因为宽后缀本就吃得下 `v12_`)。
+# key 前缀决定 `--type`:`img_*`→image、`file_*`→file(与飞书资源 API 契约一致)。
+MEDIA_KEY_RE = re.compile(r"(?:img|file)_[A-Za-z0-9_-]+")

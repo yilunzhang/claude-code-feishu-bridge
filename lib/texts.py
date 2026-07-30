@@ -10,6 +10,45 @@ INBOUND_NOTICE = {
 
 UNSUPPORTED_NOTICE = "⚠️ 暂不支持此消息类型(支持 text / image / file / post)。"
 
+
+# ---- fetch_hint(非纯文本消息 → 告诉 agent 附件可自取)----
+def media_fetch_hint(message_id, keys, profile):
+    """非文本消息的取件提示 —— **`post` 零下载**(`image`/`file` 仍自动下、放 `media_paths`),
+    只给 agent 可直接跑的命令。
+
+    为什么需要它:飞书把「图+文字」打包成 `post`,而 `MEDIA_MSG_TYPES` 只含 `image`/`file`
+    → 从不下载;lark-cli 却**已把 image_key 渲染进正文**(`![Image](img_v3_…)`)。agent 拿到
+    那串 key 却不知道它可取 → 当占位符跳过(真机实证)。故这里把「可取」这件事说出来。
+
+    每个 key **各一条命令**(多 key 只给一条则其余无从取)。要点:
+    - `--profile` **必带**:桥显式钉住 cfg["profile"](runner 在每条 argv 末尾追加);不带则
+      agent 用默认 active profile —— 与桥不一致时是**用错身份的 bot 去下载,而那个 bot 可能
+      不在群里 → 取不到**(本机两者恰好一致,故肉眼无感,别靠巧合)。
+    - `--output` **必须 cwd 相对路径**(lark-cli 拒绝绝对路径与 `..`)。
+    - **lark-cli 会按 Content-Type 自动补扩展名** → 落盘路径 ≠ 传入路径(实测传
+      `./feishu-media-…737g` 落到 `….737g.jpg`)→ 必须让 agent 读返回的 `data.saved_path`。
+    - 无 key 时**绝不编造**:给 `+messages-mget` 兜底看原始结构(注意是**复数**
+      `--message-ids`,单数 flag 不存在、照着跑必失败)。
+    """
+    lines = ["📎 本条是非文本消息,上面的正文可能不完整。"
+             "**先看 `media_paths`** —— 已下载的附件在那里(image/file 类型的消息桥会自动下);"
+             "只有 `media_paths` 里没有的资源才需要自己取(如「图+文字」的 post,桥不下载)。"]
+    if keys:
+        lines.append("正文里认出这些资源句柄,需要时自取(取完读返回 JSON 的 data.saved_path,"
+                     "别用下面 --output 里那个名字 —— lark-cli 会自动补扩展名):")
+        for k in keys:
+            lines.append(
+                "  lark-cli im +messages-resources-download"
+                " --message-id %s --file-key %s --type %s"
+                " --output ./feishu-media-%s --as bot --profile %s"
+                % (message_id, k["key"], k["type"], k["key"], profile))
+    else:
+        lines.append("正文里没认出附件 key。想看原始结构:")
+        lines.append(
+            "  lark-cli im +messages-mget --message-ids %s --no-reactions"
+            " --as bot --profile %s" % (message_id, profile))
+    return "\n".join(lines)
+
 # ---- decision_notice ----
 DECISION_NOTICE = {
     "approved": "✅ 已投递给 CC session。",

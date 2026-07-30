@@ -189,6 +189,9 @@ class TestMediaApprove:
         assert len(d) == 1
         payload = json.loads(d[0]["payload_json"])
         assert payload["media_paths"] and payload["approved_by"] == OWNER
+        # v1.4.2:**成员**(非 owner)的非文本消息经批准后同样带 hint 字段 —— 若把新字段
+        # 包进 `sender_is_owner` 判断,成员发的带说明图片会静默丢掉句柄,而全套仍绿。
+        assert "fetch_hint" in payload and "media_keys" in payload
         dec = env.jobs("decision_notice")
         assert [j["idempotency_key"] for j in dec] == [f"dec:{p['pending_id']}:approved"]
 
