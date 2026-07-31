@@ -264,8 +264,10 @@ def status_report(conn, cfg, clock):
     }
     if gate == "degraded:version_mismatch":
         rep["gate_hint"] = ("lark-cli 版本与 config.cli_version 不符,出站已停摆。"
-                            "跑 `bridgectl doctor --chat-id <测试群oc>` 全链自检通过后自动重钉版本;"
-                            "daemon 会在退避重探后自动放行(≤10min)。")
+                            "**v1.5.0 起 daemon 会自动自检重钉**(用与真实转发同形的 --markdown "
+                            "发一条到固定测试群),通过即放行、并弹一条系统通知;"
+                            "若这里仍显示停摆,说明自检**未通过**(可能是真回归)——"
+                            "看 daemon.log,必要时人工 `bridgectl doctor --chat-id <测试群oc>`。")
     elif gate.startswith("degraded"):
         rep["gate_hint"] = "身份指纹未验证(出站停摆),daemon 带退避重探;检查 VPN/lark-cli 登录。"
     return rep

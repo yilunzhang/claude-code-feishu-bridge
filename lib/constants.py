@@ -119,6 +119,11 @@ CARD_REARM_MAX_ATTEMPTS = 5
 CARD_REARM_BACKOFF_MS = 30_000
 CARD_REARM_BACKOFF_MAX_MS = 10 * 60 * 1000
 
+# 版本漂移自愈的自检群(v1.5.0)。**硬编码常量,不做成配置项**:个人部署就一个靶子群,
+# 加 config key 是过度设计(codex plan r1 CUT)。**绝不回退到工作群** —— 那会在日常群里留下
+# "发了又撤回"的痕迹。自检消息留在此群即可(已有纪律:e2e 测试消息无需善后)。
+SELFCHECK_CHAT_ID = "oc_ef148370df62f0a61e113731c6c50eb3"   # feishu-bridge e2e 测试群(勿动)
+
 SUPPORTED_MSG_TYPES = ("text", "image", "file", "post")
 MEDIA_MSG_TYPES = ("image", "file")
 
