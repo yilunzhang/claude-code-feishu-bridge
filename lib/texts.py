@@ -49,6 +49,26 @@ def media_fetch_hint(message_id, keys, profile):
             " --as bot --profile %s" % (message_id, profile))
     return "\n".join(lines)
 
+
+# ---- reply_fetch_hint(被回复/引用的消息 → 告诉 agent 可自取)----
+def reply_fetch_hint(reply_to, profile):
+    """被引用消息的取件提示 —— 只给 id 和命令,**不内联内容**。
+
+    不内联的理由:被引用的常是 `merge_forward`(整段转发记录)或长贴,内联会成倍撑大
+    每条 payload,而多数回复用不到它。
+
+    嵌套资源的 `--message-id` 必须用**被引用消息的 id**(资源挂在它身上,不是当前这条)。
+    """
+    return "\n".join([
+        "💬 本条回复/引用了另一条消息 %s —— 被引用的内容**不在**上面的正文里。需要时自取:"
+        % reply_to,
+        "  lark-cli im +messages-mget --message-ids %s --no-reactions --as bot --profile %s"
+        % (reply_to, profile),
+        "  (若取回的正文里有 img_*/file_* 句柄,下载时 --message-id 用 %s —— 资源挂在被引用"
+        "那条上,不是当前这条)" % reply_to,
+    ])
+
+
 # ---- decision_notice ----
 DECISION_NOTICE = {
     "approved": "✅ 已投递给 CC session。",

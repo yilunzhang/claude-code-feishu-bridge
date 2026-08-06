@@ -96,6 +96,12 @@ hooks(Stop/SessionEnd/StopFailure)由 plugin 的 `hooks/hooks.json` **自带**�
     (lark-cli 会按 Content-Type 自动补扩展名,落盘路径和你写的不一样),然后用 Read 看图。
     `media_keys` 为空时 `fetch_hint` 给 `+messages-mget` 兜底,可看原始结构。
     **只在确实需要看附件时才取**,不必每条都下。
+  - **`reply_to` / `reply_hint`(用户回复或引用了另一条消息时才有)= 被引用的内容
+    完全不在 `text` 里**。用户说「看下这条回复里的…」而正文里什么都没有,就是这种情况。
+    `reply_hint` 是可直接跑的 `+messages-mget` 命令,取回被引用那条的正文。
+    被引用的若是转发记录(`merge_forward`)、里面还有 `img_*`/`file_*` 句柄,
+    **下载时 `--message-id` 要用被引用那条的 id**(资源挂在它身上,不是当前这条)。
+    被引用的常常就是你上一轮的输出(用户直接回复你),那种情况上下文里已有、不必再取。
   - 处理完正常作答即可——你的最终输出会自动转发回群,不用手动回群。
 - `{"type":"farewell","code":…}` → 绑定已结束(unbind/超时/session 判死)。停掉该 Monitor,告知用户,不再处理群消息。
 - `{"type":"daemon_alert","code":"daemon_down"}` → daemon 拉不起来,提示用户看 `~/.claude/data/feishu-bridge/daemon.log`。

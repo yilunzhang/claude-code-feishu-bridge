@@ -123,7 +123,7 @@ class FakeProber:
 
 
 def mget_snapshot(message_id, chat_id, sender_id, msg_type="text", text="hi",
-                  mentions=(), sender_type="user", content=None):
+                  mentions=(), sender_type="user", content=None, reply_to=None):
     """构造 +messages-mget 的 .data.messages[] 单条 —— **真实形状**(E3 真机样例):
     正文在顶层 `content`(lark-cli 已渲染的纯文本,mention 以 "@{name}" 内联);
     **没有** body.content raw-API 形状。text 参数=去掉 @ 前缀的消息本体,
@@ -139,7 +139,7 @@ def mget_snapshot(message_id, chat_id, sender_id, msg_type="text", text="hi",
             content = "(文件) a.pdf"
         else:
             content = ""
-    return {
+    snap = {
         "message_id": message_id,
         "chat_id": chat_id,
         "msg_type": msg_type,
@@ -147,6 +147,11 @@ def mget_snapshot(message_id, chat_id, sender_id, msg_type="text", text="hi",
         "content": content,
         "mentions": mentions,
     }
+    # 真机:非回复的消息**根本没有 reply_to 键**(不是 null)—— 保持同形,
+    # 否则「用 `in snap` 判定」的实现会被 fixture 惯出来的 null 键蒙混过关。
+    if reply_to is not None:
+        snap["reply_to"] = reply_to
+    return snap
 
 
 def raw_body_snapshot(message_id, chat_id, sender_id, msg_type="text", text="hi",

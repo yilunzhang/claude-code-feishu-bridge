@@ -407,6 +407,13 @@ class Inbound:
             keys = _media_keys(raw) if isinstance(raw, str) else []
             payload["media_keys"] = keys
             payload["fetch_hint"] = texts.media_fetch_hint(mid, keys, self.cfg["profile"])
+        # 回复/引用 → 附「被引用消息可自取」句柄。**闸门与上面的媒体分支相互独立**:
+        # 带引用的消息 msg_type 仍是 `text`,套用 `msg_type != "text"` 会整个漏掉。
+        # 「图 + 引用」两个 hint 都要有,故用两个独立字段、不共用一个键。
+        reply_to = snap.get("reply_to")
+        if isinstance(reply_to, str) and reply_to:
+            payload["reply_to"] = reply_to
+            payload["reply_hint"] = texts.reply_fetch_hint(reply_to, self.cfg["profile"])
         existing = self.conn.execute(
             "SELECT delivery_seq FROM deliveries WHERE binding_id=? AND message_id=?",
             (binding["binding_id"], mid)).fetchone()
