@@ -135,14 +135,47 @@ def foreign_stop_hooks():
 
 # ---------------------------------------------------------------- chats
 def list_chats(runner):
-    res = runner.run(["im", "+chat-list", "--as", "bot"], timeout_s=30)
-    env = runner_mod.parse_envelope(res.stdout)
-    if res.rc != 0 or not runner_mod.envelope_ok(env):
-        return None
-    data = runner_mod.data_of(env)
-    items = data.get("items") or data.get("chats") or []
-    return [{"chat_id": i.get("chat_id"), "name": i.get("name")}
-            for i in items if isinstance(i, dict) and i.get("chat_id")]
+    """列出 bot 所在的**全部**群:跟着 has_more 翻页,取不全就整体失败(返回 None)。
+
+    `im +chat-list` 不自动翻页(默认 page-size=20)。只取首页会得到一个**和全集长得
+    一模一样**的残缺列表——没有报错、条目也都是真的——调用方会把"不在列表里"读成
+    "这个群不存在"并去新建一个重复群。所以宁可失败,也不返回取不全的前缀。
+
+    三条契约:
+    - 终止只认 `has_more is False`;缺失/非布尔一律当"证明不了取全"→ None。
+    - **`page_token` 重复不代表没前进**:该接口从第 2 页起会一直返回同一个 token,
+      内容却照常推进,按"重复即失败"判会把能正常取全的路径判死。
+    - 推进以**本页有没有带来新 chat_id** 为准(空页/全畸形/全是已见 id 都不算),
+      否则会在那个恒定 token 上无限循环。"""
+    chats, seen_ids, page_token = [], set(), None
+    while True:
+        argv = ["im", "+chat-list", "--as", "bot", "--page-size", "100"]
+        if page_token:
+            argv += ["--page-token", page_token]
+        res = runner.run(argv, timeout_s=30)
+        env = runner_mod.parse_envelope(res.stdout)
+        if res.rc != 0 or not runner_mod.envelope_ok(env):
+            return None
+        data = runner_mod.data_of(env)
+        fresh = 0
+        for i in data.get("items") or data.get("chats") or []:
+            if not isinstance(i, dict) or not i.get("chat_id"):
+                continue
+            if i["chat_id"] in seen_ids:
+                continue
+            seen_ids.add(i["chat_id"])
+            chats.append({"chat_id": i["chat_id"], "name": i.get("name")})
+            fresh += 1
+        has_more = data.get("has_more")
+        if has_more is False:
+            return chats
+        # 缺失/非布尔 has_more:证明不了取全了,不当成功(该接口实测始终返回真布尔)。
+        if has_more is not True:
+            return None
+        # 声称还有更多,却没给 cursor、或本页没带来任何新 id:无法证明有推进。
+        if not data.get("page_token") or fresh == 0:
+            return None
+        page_token = data["page_token"]
 
 
 # ---------------------------------------------------------------- bind / unbind

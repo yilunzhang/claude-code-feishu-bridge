@@ -5,7 +5,7 @@ import pathlib
 import pytest
 
 from tests.conftest import CC_PID, CC_START, CHAT, PROFILE
-from tests.helpers import FakeRunResult, FakeRunner, ok_envelope
+from tests.helpers import FakeRunResult, FakeRunner, err_envelope, ok_envelope
 from lib import config as configmod
 from lib import ctl, lifecycle, paths
 
@@ -160,9 +160,145 @@ class TestStatusAndChats:
     def test_list_chats(self, env):
         env.runner.on_prefix(["im", "+chat-list"], lambda a, c: ok_envelope(
             {"items": [{"chat_id": "oc_1", "name": "群A"},
-                       {"chat_id": "oc_2", "name": "群B"}]}))
+                       {"chat_id": "oc_2", "name": "群B"}],
+             "has_more": False}))
         chats = ctl.list_chats(env.runner)
         assert [c["chat_id"] for c in chats] == ["oc_1", "oc_2"]
+
+    def test_list_chats_fails_when_has_more_missing(self, env):
+        """缺 has_more = 证明不了取全了,不能当"翻完了"成功返回。
+
+        故意**带上** page_token:否则"缺 token"那条守卫会顺手返回 None,
+        本用例就会因为别的原因变绿,测不到 has_more 的真值判断。
+        第三次调用的 fail 兜底:守卫被整条删掉时不让测试挂死。"""
+        state = {"n": 0}
+
+        def respond(a, c):
+            state["n"] += 1
+            if state["n"] > 2:
+                pytest.fail("has_more 缺失时仍在继续翻页(守卫回归)")
+            return ok_envelope({"chats": [{"chat_id": f"oc_{state['n']}", "name": "群"}],
+                                "page_token": f"tok{state['n'] + 1}"})
+
+        env.runner.on_prefix(["im", "+chat-list"], respond)
+        assert ctl.list_chats(env.runner) is None
+        assert len(env.runner.calls_matching("im", "+chat-list")) == 1
+
+    def test_list_chats_follows_pagination(self, env):
+        """has_more=true 时必须翻页取全:漏页 = 用户的群"不在列表里",
+        照 SKILL.md 会去新建一个重复群。"""
+        pages = {
+            None: {"chats": [{"chat_id": "oc_1", "name": "群A"}],
+                   "has_more": True, "page_token": "tok2"},
+            "tok2": {"chats": [{"chat_id": "oc_2", "name": "群B"}],
+                     "has_more": True, "page_token": "tok3"},
+            "tok3": {"chats": [{"chat_id": "oc_3", "name": "群C"}],
+                     "has_more": False, "page_token": ""},
+        }
+
+        def respond(a, c):
+            tok = a[a.index("--page-token") + 1] if "--page-token" in a else None
+            return ok_envelope(pages[tok])
+
+        env.runner.on_prefix(["im", "+chat-list"], respond)
+        chats = ctl.list_chats(env.runner)
+        assert [c["chat_id"] for c in chats] == ["oc_1", "oc_2", "oc_3"]
+
+    def test_list_chats_keeps_paging_when_token_repeats_but_content_advances(self, env):
+        """该接口实测会在多页间返回**同一个** page_token 而内容照常推进。
+        按"重复 token 即失败"判,会把这条能正确取全的路径判成失败。"""
+        pages = [
+            {"chats": [{"chat_id": "oc_1", "name": "群A"}], "has_more": True,
+             "page_token": "same"},
+            {"chats": [{"chat_id": "oc_2", "name": "群B"}], "has_more": True,
+             "page_token": "same"},
+            {"chats": [{"chat_id": "oc_3", "name": "群C"}], "has_more": False,
+             "page_token": ""},
+        ]
+        state = {"n": 0}
+
+        def respond(a, c):
+            state["n"] += 1
+            return ok_envelope(pages[min(state["n"], len(pages)) - 1])
+
+        env.runner.on_prefix(["im", "+chat-list"], respond)
+        chats = ctl.list_chats(env.runner)
+        assert [c["chat_id"] for c in chats] == ["oc_1", "oc_2", "oc_3"]
+
+    def test_list_chats_fails_when_page_returns_nothing(self, env):
+        """has_more=true 但这一页空手而归 = 无法证明有推进 → 整体失败,
+        绝不能返回已取到的前缀(那又是一个"残缺列表伪装成全集")。
+        守卫若被删除,这个 fake 会无限供页 → 第三次调用直接 fail,不让测试挂死。"""
+        state = {"n": 0}
+
+        def respond(a, c):
+            state["n"] += 1
+            if state["n"] > 2:
+                pytest.fail("空页且 has_more=true 时仍在继续翻页(守卫回归)")
+            if state["n"] == 1:
+                return ok_envelope({"chats": [{"chat_id": "oc_1", "name": "群A"}],
+                                    "has_more": True, "page_token": "tok2"})
+            return ok_envelope({"chats": [], "has_more": True, "page_token": "tok3"})
+
+        env.runner.on_prefix(["im", "+chat-list"], respond)
+        assert ctl.list_chats(env.runner) is None
+        assert len(env.runner.calls_matching("im", "+chat-list")) == 2
+
+    def test_list_chats_fails_when_page_repeats_same_ids(self, env):
+        """非空页 ≠ 有推进:服务端可能一直回同一批 id 且 has_more=true。
+        只看"页非空"会在恒定 token 上无限循环 → 判据必须是**有没有新 chat_id**。"""
+        state = {"n": 0}
+
+        def respond(a, c):
+            state["n"] += 1
+            if state["n"] > 3:
+                pytest.fail("整页都是已见 id 时仍在继续翻页(守卫回归)")
+            cid = "oc_1" if state["n"] == 1 else "oc_2"
+            return ok_envelope({"chats": [{"chat_id": cid, "name": "群"}],
+                                "has_more": True, "page_token": "same"})
+
+        env.runner.on_prefix(["im", "+chat-list"], respond)
+        assert ctl.list_chats(env.runner) is None
+        assert len(env.runner.calls_matching("im", "+chat-list")) == 3
+
+    def test_list_chats_fails_when_page_has_only_malformed_items(self, env):
+        """整页都是畸形条目(非 dict / 缺 chat_id)也不算推进。"""
+        state = {"n": 0}
+
+        def respond(a, c):
+            state["n"] += 1
+            if state["n"] > 2:
+                pytest.fail("整页畸形条目时仍在继续翻页(守卫回归)")
+            if state["n"] == 1:
+                return ok_envelope({"chats": [{"chat_id": "oc_1", "name": "群A"}],
+                                    "has_more": True, "page_token": "tok2"})
+            return ok_envelope({"chats": [{}, {"name": "没有 chat_id"}, "不是 dict"],
+                                "has_more": True, "page_token": "tok3"})
+
+        env.runner.on_prefix(["im", "+chat-list"], respond)
+        assert ctl.list_chats(env.runner) is None
+
+    def test_list_chats_fails_when_more_pages_but_no_token(self, env):
+        """has_more=true 但没给 token:同样是取不全,不能当成功。"""
+        env.runner.on_prefix(["im", "+chat-list"], lambda a, c: ok_envelope(
+            {"chats": [{"chat_id": "oc_1", "name": "群A"}],
+             "has_more": True, "page_token": ""}))
+        assert ctl.list_chats(env.runner) is None
+
+    def test_list_chats_partial_page_failure_is_not_silent(self, env):
+        """第 2 页失败时不能"就把第 1 页当全部返回" —— 那正是本 bug 的形状
+        (残缺列表看起来和完整列表一模一样)。"""
+        state = {"n": 0}
+
+        def respond(a, c):
+            state["n"] += 1
+            if state["n"] == 1:
+                return ok_envelope({"chats": [{"chat_id": "oc_1", "name": "群A"}],
+                                    "has_more": True, "page_token": "tok2"})
+            return err_envelope(99991400, "rate limited")
+
+        env.runner.on_prefix(["im", "+chat-list"], respond)
+        assert ctl.list_chats(env.runner) is None
 
 
 class TestDoctor:

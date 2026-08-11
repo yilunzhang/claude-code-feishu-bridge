@@ -86,7 +86,8 @@ def cmd_chats(args):
     runner = LarkRunner(cfg["profile"])
     chats = ctl.list_chats(runner)
     if chats is None:
-        out({"ok": False, "error": "im +chat-list 失败(检查 VPN/lark-cli 登录)"}, 2)
+        out({"ok": False,
+             "error": "群列表未能完整取回(命令失败或分页未取完)"}, 2)
     out({"ok": True, "chats": chats})
 
 

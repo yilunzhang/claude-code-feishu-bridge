@@ -35,7 +35,30 @@ hooks(Stop/SessionEnd/StopFailure)由 plugin 的 `hooks/hooks.json` **自带**�
    ```
    把群列表给用户选(AskUserQuestion)。bot 必须已在目标群里。
 
-   **列表里没有对题的群时,别只让用户从既有群里挑 —— 主动提议新建一个**(省掉用户手动拉群;
+   **🔑 别拿"不在 `chats` 列表里"当"群不存在"的证据**。`chats` 只列 **bot 已在其中**的群,
+   所以"不在列表里"有两种含义:群真不存在,或**群存在但 bot 不在里面**。后者去新建 = 造一个
+   同名重复群,而用户要的那个还在原地。建群是外发且不可逆的,先做这一步再决定:
+
+   1. **先问用户目标群名**(纯文本问,别猜一个项目关键词就去搜——搜不到什么都证明不了)。
+   2. 用 user 身份按该名字搜(`profile` 从 `bridgectl.py status` 的 `.fingerprint.profile` 取):
+      ```bash
+      lark-cli im +chat-search --query <用户给的群名> --as user --page-size 100 \
+        --disable-search-by-user --profile <profile>
+      ```
+      - **`--disable-search-by-user` 必带**:默认会**先按成员名搜**,搜一个人名能回上百个
+        与群名毫无关系的群(该用户所在的群都算命中)。不带它,"搜到了"几乎必然是误判。
+      - `+chat-search` 同样**默认只回 20 条单页**;`data.has_more=true` 就带
+        `--page-token <data.page_token>` 继续翻,直到 `has_more=false`。
+   3. `--query` 是**关键词**搜索、不是精确匹配 → **只有返回项的群名与用户给的名字完全相等
+      才算命中**,其余关键词结果一律忽略。
+   4. **命令失败 / 没翻完 / token 拿不到 → 停下问用户,不要进入建群**(取不全的结果
+      和"确实没有"长得一样)。
+
+   注意这**只排除掉「当前 user 可见范围内的同名群」,不证明租户里不存在**——
+   `+chat-search` 搜的是 user 可见的群。搜到同名的 → 让用户把 bot 拉进那个群,别新建;
+   完整搜完无同名 → 仍要用户**明确确认**再新建。
+
+   **用户确认要新建时,别只让他从既有群里挑 —— 主动提议新建**(省掉用户手动拉群;
    bot 建群时会**自动入群**,比"把 bot 加进已有群"可靠得多——后者常被"仅群主可加人"卡住):
    ```bash
    lark-cli im +chat-create --as bot --name <确认后的群名> --chat-mode group --type private \
