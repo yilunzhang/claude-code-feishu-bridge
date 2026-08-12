@@ -11,7 +11,7 @@ import sys
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
 from lib import config as configmod  # noqa: E402
-from lib import constants, ctl, db, lifecycle, paths, procs  # noqa: E402
+from lib import constants, ctl, db, lifecycle, paths, procs, senderallow  # noqa: E402
 from lib.clock import SystemClock  # noqa: E402
 from lib.runner import LarkRunner  # noqa: E402
 
@@ -168,6 +168,24 @@ def cmd_doctor(args):
     out(res, 0 if res.get("ok") else 2)
 
 
+def cmd_allow(args):
+    """成员直投白名单的读/加/删。写完**下一条消息即生效**(daemon 每次判定读盘)。"""
+    configmod.require_config()
+    if args.action == "list":
+        out({"ok": True, "entries": senderallow.load_entries()})
+    # add/remove 两个 id 都必填:少任一个就成了"整个群放行"或"该用户在所有群放行",
+    # 都超出 owner 的授权范围。argparse 表达不了"按 action 条件必填",故在此显式挡。
+    if not args.chat_id or not args.open_id:
+        out({"ok": False, "error": "add/remove 必须同时给 --chat-id 与 --open-id"}, 2)
+    if args.action == "add":
+        entries, added = senderallow.add_entry(args.chat_id, args.open_id, args.note)
+        out({"ok": True, "added": added, "entries": entries,
+             "note": "已加入" if added else "已存在,未重复添加"})
+    entries, removed = senderallow.remove_entry(args.chat_id, args.open_id)
+    out({"ok": True, "removed": removed, "entries": entries,
+         "note": "已移除" if removed else "名单里没有这一条"})
+
+
 def main():
     p = argparse.ArgumentParser(prog="bridgectl")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -194,6 +212,12 @@ def main():
     sp = sub.add_parser("doctor")
     sp.add_argument("--chat-id", required=True)
     sp.set_defaults(fn=cmd_doctor)
+    sp = sub.add_parser("allow", help="成员直投白名单(group+user 双精确匹配)")
+    sp.add_argument("action", choices=("list", "add", "remove"))
+    sp.add_argument("--chat-id", default=None)
+    sp.add_argument("--open-id", default=None)
+    sp.add_argument("--note", default=None, help="备注(给人看,不参与判定)")
+    sp.set_defaults(fn=cmd_allow)
     args = p.parse_args()
     try:
         args.fn(args)

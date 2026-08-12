@@ -3,7 +3,8 @@
 import json
 import sqlite3
 
-from . import constants, db, jobs, lifecycle, media, runner as runner_mod, texts, util
+from . import (constants, db, jobs, lifecycle, media, runner as runner_mod,
+               senderallow, texts, util)
 
 
 def normalize_receive(obj):
@@ -327,6 +328,15 @@ class Inbound:
                 return True  # 保持原状态,事务外物化后 finalize
             self._enqueue_in_tx(row, binding, snap, from_state, now)
             return False
+        # 白名单成员((chat_id, open_id) 双精确匹配)→ 免审批直投,但**信任级别不变**:
+        # payload 仍 sender_is_owner=false + approved_by="allowlist",agent 侧照旧当
+        # 不可信输入。判定每次读盘 → owner 让 agent 改完文件下一条消息即生效。
+        if senderallow.is_allowed(row["chat_id"], sender_id):
+            if mtype in constants.MEDIA_MSG_TYPES:
+                return True  # 与 owner 同路:事务外物化后 finalize
+            self._enqueue_in_tx(row, binding, snap, from_state, now,
+                                approved_by=constants.APPROVED_BY_ALLOWLIST)
+            return False
         # member → 审批门(纯机械;绝不直投)
         reason = self._member_quota_reason(row["chat_id"], sender_id, now)
         if reason:
@@ -436,7 +446,12 @@ class Inbound:
         return True
 
     def _materialize_then_finalize(self, row, snap, from_state, approved_pending=None):
-        """owner 媒体 / 已批准 member 媒体:网络物化(事务外)→ 单事务复验+入队。"""
+        """owner 媒体 / 白名单成员媒体 / 已批准 member 媒体:
+        网络物化(事务外)→ 单事务复验+入队。
+
+        `approved_by` 三种来源必须区分开(否则白名单成员的图会**长得和 owner 本人发的一样**):
+        点按钮 → 该 owner 的 operator_id;白名单 → `"allowlist"`;owner 本人 → None。
+        """
         mid = row["message_id"]
         now = self.clock.wall_ms()
         try:
@@ -463,9 +478,17 @@ class Inbound:
             b = self._binding_of(row)
             now = self.clock.wall_ms()
             if b is not None and b["status"] == "active":
+                sender_id, _ = sender_of(snap)
+                if approved_pending is not None:
+                    approved_by = approved_pending["decided_by"]
+                elif sender_id != self.cfg["owner_open_id"]:
+                    # 非 owner 又走到这里 ⟹ 只可能是白名单直投(审批路径必带 pending)
+                    approved_by = constants.APPROVED_BY_ALLOWLIST
+                else:
+                    approved_by = None
                 self._enqueue_in_tx(
                     row, b, snap, from_state, now, media_paths=paths,
-                    approved_by=approved_pending["decided_by"] if approved_pending else None,
+                    approved_by=approved_by,
                     create_receipt=approved_pending is None)
                 if approved_pending is not None:
                     jobs.create_job(

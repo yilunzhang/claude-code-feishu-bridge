@@ -37,6 +37,12 @@ def config_path():
     return data_dir() / "config.json"
 
 
+def allowlist_path():
+    """成员直投白名单。**独立于 config.json**:config 是 bootstrap 期钉死的指纹
+    (profile/app_id/owner/cli_version),白名单则由 agent 在运行时按 owner 指令改写。"""
+    return data_dir() / "allowlist.json"
+
+
 def lock_path():
     return data_dir() / "bridge.lock"
 

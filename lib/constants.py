@@ -126,6 +126,9 @@ SELFCHECK_CHAT_ID = "oc_ef148370df62f0a61e113731c6c50eb3"   # feishu-bridge e2e 
 
 SUPPORTED_MSG_TYPES = ("text", "image", "file", "post")
 MEDIA_MSG_TYPES = ("image", "file")
+# 白名单直投时 payload 的 approved_by 值。**不留 None** —— None 是 owner 本人的语义,
+# 混用会让 agent 把白名单成员的消息当成 owner 本人发的(信任级别不同)。
+APPROVED_BY_ALLOWLIST = "allowlist"
 
 # 附件句柄(image_key / file_key)—— 从正文里认出可自取的资源 key。
 # 形如 `img_v3_02143_6ea09006-e575-47a2-89e7-4a683ace737g`(真机实测),也有不带版本号的
