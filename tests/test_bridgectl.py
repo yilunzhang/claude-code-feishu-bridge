@@ -550,3 +550,87 @@ def test_cmd_bind_fails_closed_when_restart_leaves_daemon_not_ready(env, monkeyp
     assert ei.value.code == 5
     assert env.conn.execute("SELECT COUNT(*) FROM pending_bind").fetchone()[0] == 0
     assert env.conn.execute("SELECT COUNT(*) FROM bindings").fetchone()[0] == 0
+
+
+class TestWaitListenerClaim:
+    """bind 等 follower 认领:已认领立即 true 不 sleep;后到认领 true;超时 false。"""
+
+    def test_already_claimed_returns_without_sleep(self, env):
+        bid = env.make_binding(status="starting", bind_phase="confirmed", session_id="s1",
+                               listener_epoch=1)
+        sleeps = []
+        assert ctl.wait_listener_claim(env.conn, bid, env.clock, sleeps.append, 6000) is True
+        assert sleeps == []
+
+    def test_claimed_after_second_poll(self, env):
+        bid = env.make_binding(status="starting", bind_phase="unconfirmed")
+        calls = []
+
+        def sleep(s):
+            calls.append(s)
+            env.clock.tick(int(s * 1000))
+            if len(calls) == 2:
+                env.conn.execute(
+                    "UPDATE bindings SET listener_pid=7001, listener_start='ls', "
+                    "listener_epoch=1, listener_beat_at=? WHERE binding_id=?",
+                    (env.clock.wall_ms(), bid))
+            if len(calls) > 10:
+                pytest.fail("认领后仍在轮询")
+
+        assert ctl.wait_listener_claim(env.conn, bid, env.clock, sleep, 6000) is True
+        assert calls == [0.5, 0.5]  # 0.5s 轮询,认领后立即停
+
+    def test_never_claimed_times_out(self, env):
+        bid = env.make_binding(status="starting", bind_phase="unconfirmed")
+        start = env.clock.mono_ms()
+        calls = []
+
+        def sleep(s):
+            calls.append(s)
+            env.clock.tick(int(s * 1000))
+            if len(calls) > 100:
+                pytest.fail("超时后仍在轮询")
+
+        assert ctl.wait_listener_claim(env.conn, bid, env.clock, sleep, 6000) is False
+        assert env.clock.mono_ms() - start == 6000  # 恰在上限放弃,不多等
+
+
+def _run_cmd_bind_with_wait(env, ctl_prober, monkeypatch, capsys, claim_at_s=None):
+    """跑 bridgectl bind(等待真实执行,fake sleep 推时钟);claim_at_s 给定时在该秒数由"别人"认领该行。"""
+    import sys
+    bridgectl = _load_bridgectl()
+    monkeypatch.setattr(bridgectl.ctl, "ensure_daemon", lambda *a, **k: "running")
+    monkeypatch.setattr(bridgectl.ctl, "reconcile_daemon_code_identity",
+                        lambda *a, **k: {"restarted": False, "reason": "match"})
+    monkeypatch.setattr(bridgectl.procs, "SystemProber", lambda: ctl_prober)
+    monkeypatch.setattr(bridgectl.os, "getppid", lambda: ZSH_PID)
+    monkeypatch.setattr(bridgectl, "SystemClock", lambda: env.clock)
+    sleeps = []
+
+    def fake_sleep(s):
+        sleeps.append(s)
+        env.clock.tick(int(s * 1000))
+        if claim_at_s is not None and abs(sum(sleeps) - claim_at_s) < 1e-9:
+            env.conn.execute(
+                "UPDATE bindings SET listener_pid=7001, listener_start='ls', listener_epoch=1, "
+                "listener_beat_at=? WHERE status='starting'", (env.clock.wall_ms(),))
+
+    monkeypatch.setattr(bridgectl.time, "sleep", fake_sleep)
+    monkeypatch.setattr(sys, "argv", ["bridgectl", "bind", "--chat-id", CHAT, "--chat-name", "g"])
+    with pytest.raises(SystemExit) as ei:
+        bridgectl.main()
+    assert ei.value.code == 0
+    return json.loads(capsys.readouterr().out), sleeps
+
+
+def test_cmd_bind_reports_listener_claimed_false_when_nobody_claims(env, ctl_prober, monkeypatch, capsys):
+    res, sleeps = _run_cmd_bind_with_wait(env, ctl_prober, monkeypatch, capsys)
+    assert res["ok"] is True and res["listener_claimed"] is False
+    assert sum(sleeps) == 6.0  # 等满 3 tick(6s)才放弃
+
+
+def test_cmd_bind_reports_listener_claimed_true_when_claimed_at_4s(env, ctl_prober, monkeypatch, capsys):
+    """follower 2s tick 下第 4 秒才认领(慢启动)→ 仍报 true;上限若缩成 1 tick 会错报 false、把模型导向手动 Monitor。"""
+    res, sleeps = _run_cmd_bind_with_wait(env, ctl_prober, monkeypatch, capsys, claim_at_s=4.0)
+    assert res["ok"] is True and res["listener_claimed"] is True
+    assert sum(sleeps) == 4.0  # 认领后立即返回,不等满

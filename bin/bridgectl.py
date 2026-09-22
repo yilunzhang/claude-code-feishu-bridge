@@ -7,6 +7,7 @@ import json
 import os
 import pathlib
 import sys
+import time
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
@@ -123,6 +124,11 @@ def cmd_bind(args):
     except lifecycle.BindConflict as e:
         out({"ok": False, "error": str(e), "code": e.code}, 4)
     res["ok"] = True
+    # 等常驻 listener(插件 monitor)认领,最多 3 tick;false = 6s 内未观察到认领(monitor 未 arm /
+    # 启动慢 / 启动失败),skill 据此在回复 marker 之前回退手动起有参 Monitor。
+    res["listener_claimed"] = ctl.wait_listener_claim(
+        conn, res["binding_id"], clock, time.sleep,
+        int(constants.LISTENER_TICK_S * 3 * 1000))
     res["daemon"] = state
     res["code_identity"] = reconcile
     res["hooks"] = hooks
@@ -132,7 +138,8 @@ def cmd_bind(args):
                              "绑定确认(握手)依赖 Stop hook —— 若刚安装/更新 plugin,请确保**已重启 "
                              "Claude Code** 让 hooks 生效。这是软提示;权威证明是握手成功 + 群内「✅ 已绑定」:"
                              "若约 10 分钟内群里未出现,说明 hooks 未生效,重启 CC 后重跑 bind。")
-    res["next"] = ("1) 启动 persistent Monitor 跑 listener_cmd;"
+    res["next"] = ("1) listener_claimed=true 则常驻 listener 已接管、不要手动起 Monitor;"
+                   "false = 6s 内未观察到认领 → 手动 Monitor 跑 listener_cmd(须在回复 marker 之前);"
                    "2) 在给用户的回复文本里原样包含 marker 一行(触发 Stop 握手);"
                    "3) 回复里带上 banner 提醒。")
     out(res)

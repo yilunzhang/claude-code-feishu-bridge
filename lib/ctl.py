@@ -206,6 +206,21 @@ def bind_prepare(conn, cfg, clock, prober, chat_id, chat_name, cwd, start_pid):
     }
 
 
+def wait_listener_claim(conn, binding_id, clock, sleep, timeout_ms):
+    """等常驻 listener(插件 monitor 的 follower)认领刚建的绑定:行 listener_epoch>=1 即 True,
+    每 0.5s 轮询,超 timeout_ms → False(调用方据此回退为手动起有参 listener)。已认领时不 sleep。
+    必须发生在 marker 握手之前:确认后 30s 无心跳会 listener_never_ready 关行,之后再起 listener 只会看到终态。"""
+    deadline = clock.mono_ms() + timeout_ms
+    while True:
+        row = conn.execute("SELECT listener_epoch FROM bindings WHERE binding_id=?",
+                           (binding_id,)).fetchone()
+        if row is not None and row["listener_epoch"] >= 1:
+            return True
+        if clock.mono_ms() >= deadline:
+            return False
+        sleep(0.5)
+
+
 def resolve_instance_binding(conn, prober, start_pid):
     inst = procs.find_cc_instance(prober, start_pid)
     if inst is None:

@@ -1,4 +1,4 @@
-"""listener 核心(plan 4.4;bin/listener.py 在 Monitor 内驱动)。
+"""listener 核心(plan 4.4;bin/listener.py 驱动)。
 - 父自检:cc 实例确定死 → 静默 exit。
 - 接管/身份:单条 CAS(epoch 比对 + 观察旧元组;探测 UNKNOWN 一律按存活处理)。
 - 心跳即租约:CAS 带我的 epoch,rowcount=0 → 被接管 exit。
@@ -181,3 +181,34 @@ class ListenerCore:
         if self._ensure_fails >= ALERT_AFTER_FAILS and not self._alert_sent:
             self._alert_sent = True
             self.printer(util.jdumps({"type": "daemon_alert", "code": "daemon_down"}))
+
+
+class InstanceFollower:
+    """跟随一个 CC 实例的常驻 listener(插件 monitor 无参模式):
+    - 无 core 时:实例确定死 → exit(UNKNOWN 按活);本实例有 starting/active 绑定 → 为它建一个新 core 认领;否则 idle。
+    - 持有 core 时:只驱动 core(父自检由 core 自己做);core 退出(farewell 已由它打印)→ 清空回等待,不退出,
+      再次 bind 会被下一个新 core 接住。
+    多个 follower 并存时,多余者建 core → 看到持有者心跳新鲜 → 立即退出清空,不加协调层。"""
+
+    def __init__(self, conn, cc_pid, cc_start, prober, core_factory):
+        self.conn = conn
+        self.cc_pid = cc_pid
+        self.cc_start = cc_start
+        self.prober = prober
+        self.core_factory = core_factory
+        self.core = None
+
+    def step(self):
+        if self.core is None:
+            if procs.probe_alive(self.prober, self.cc_pid, self.cc_start) == procs.DEAD:
+                return "exit"
+            row = self.conn.execute(
+                "SELECT binding_id FROM bindings WHERE cc_pid=? AND cc_start=? "
+                "AND status IN ('starting','active')", (self.cc_pid, self.cc_start)).fetchone()
+            if row is None:
+                return "idle"
+            self.core = self.core_factory(row["binding_id"])
+        if self.core.step() == "exit":
+            self.core = None
+            return "idle"
+        return "ok"

@@ -81,17 +81,19 @@ hooks(Stop/SessionEnd/StopFailure)由 plugin 的 `hooks/hooks.json` **自带**�
    ```bash
    python3 "${CLAUDE_SKILL_DIR}/../../bin/bridgectl.py" bind --chat-id <oc_...> --chat-name <群名>
    ```
-   失败(该群/本实例已有绑定)→ 照 error 提示处理。成功输出含 `binding_id` / `marker` / `banner` / `listener_cmd`;若输出带 `hooks_note`(未检测到 hooks 心跳),转告用户「若群里 10 分钟内没出现 ✅ 已绑定,说明 hooks 未生效,重启 CC 后重试」。
+   失败(该群/本实例已有绑定)→ 照 error 提示处理。成功输出含 `binding_id` / `marker` / `banner` / `listener_cmd` / `listener_claimed`;若输出带 `hooks_note`(未检测到 hooks 心跳),转告用户「若群里 10 分钟内没出现 ✅ 已绑定,说明 hooks 未生效,重启 CC 后重试」。
 
-4. **起 listener(persistent Monitor)**:
-   ```
-   Monitor(
-     command="<上一步的 listener_cmd 原样>",
-     description="feishu-bridge listener",
-     persistent=true,
-     timeout_ms=3600000
-   )
-   ```
+4. **看 `listener_claimed`**(listener 由 plugin monitor 承载:本 skill 以 `/feishu-bridge:bridge` 全名被调用时自动 arm,随 session 常驻、跟随本 CC 实例自动认领绑定):
+   - `true`(常态):插件 monitor 已接管,**不要手动起 Monitor**。
+   - `false`:6 秒内没观察到 listener 认领。可能原因:插件 monitor 没 arm(plugin 刚更新、本 session 未重启;或本 skill 不是以 `/feishu-bridge:bridge` 全名调用)、monitor 启动慢、或 listener 启动失败(见下文 farewell `no-instance`)。此时按 `listener_cmd` 手动起有参 listener(受 Monitor 工具 30 分钟到期限制,到期要重挂):
+     ```
+     Monitor(
+       command="<上一步的 listener_cmd 原样>",
+       description="feishu-bridge listener",
+       timeout_ms=1800000
+     )
+     ```
+     并告知用户:若是 monitor 没 arm,重启 session 后重新 bind 才能恢复常驻。**这一步要在回复 marker 之前完成**(握手确认后 30 秒内没有 listener 心跳,绑定会被关掉)。
 
 5. **回复用户完成握手**:你给用户的**同一条回复文本**里必须原样包含 marker 单独一行(触发 Stop hook 握手确认),并附 banner 提醒。例:
 
@@ -131,7 +133,8 @@ hooks(Stop/SessionEnd/StopFailure)由 plugin 的 `hooks/hooks.json` **自带**�
     **下载时 `--message-id` 要用被引用那条的 id**(资源挂在它身上,不是当前这条)。
     被引用的常常就是你上一轮的输出(用户直接回复你),那种情况上下文里已有、不必再取。
   - 处理完正常作答即可——你的最终输出会自动转发回群,不用手动回群。
-- `{"type":"farewell","code":…}` → 绑定已结束(unbind/超时/session 判死)。停掉该 Monitor,告知用户,不再处理群消息。
+- `{"type":"farewell","code":…}` → 绑定已结束(unbind/超时/session 判死)。告知用户,不再处理群消息。插件 monitor 的 listener 常驻,重新 bind 会自动接住,**不用停**;若是手动起的有参 Monitor,它会自己退出。
+  **例外 `code="no-instance"`**:不是绑定结束,而是常驻 listener 启动失败(定位不到本 CC 实例)且进程已退出,本 session 不会再自动 arm —— 之后要绑定就按 bind 输出的 `listener_cmd` 手动起有参 Monitor,或重启 session。
 - `{"type":"daemon_alert","code":"daemon_down"}` → daemon 拉不起来,提示用户看 `~/.claude/data/feishu-bridge/daemon.log`。
 
 ## unbind(立即生效;敏感操作前的逃生门)
@@ -139,7 +142,7 @@ hooks(Stop/SessionEnd/StopFailure)由 plugin 的 `hooks/hooks.json` **自带**�
 ```bash
 python3 "${CLAUDE_SKILL_DIR}/../../bin/bridgectl.py" unbind
 ```
-然后 TaskStop 掉 listener 的 Monitor 任务(listener 自己也会在几秒内自检退出)。告知用户已解绑;之后输出不再转发。事后可随时重新 bind。
+告知用户已解绑;之后输出不再转发。listener 不用停:插件 monitor 常驻等待下一次 bind;手动起的有参 Monitor 会在几秒内自检退出。事后可随时重新 bind。
 
 ## 成员直投白名单(owner 让你「把某人加白名单」时)
 

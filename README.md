@@ -17,7 +17,7 @@
     出站:outbound_jobs per-kind 守卫线性化→argv 发送→契约解析(唯一发送进程)
     存活:cc_gone / listener 心跳租约 两条独立 CAS;恢复工人驱动一切非终态
               ▲ hooks:Stop/SessionEnd 只写库(零网络);StopFailure 联网(API 错误 → @群主 告警)
-              ▼ listener 领取(epoch 排他+lease),print 到 persistent Monitor stdout
+              ▼ listener(plugin monitor 常驻,跟随本 CC 实例自动认领绑定)领取(epoch 排他+lease),print 到 monitor stdout
   绑定 session(CC 实例)
 ```
 
@@ -75,7 +75,7 @@ python3 $B ensure-daemon        # 手动确活 daemon
 python3 $B doctor --chat-id oc_x  # 真发送+撤回自检(opt-in,勿对生产群随手用)
 ```
 
-bind 完整握手需要 CC 侧:起 persistent Monitor 跑 `bin/listener.py <binding_id>`,并在回复文本里原样包含 `[feishu-bridge-bind:<nonce>]` marker(Stop hook 借此确认"输出通道=这个 session")。流程细节见 SKILL.md。
+bind 完整握手需要 CC 侧:listener 由 plugin monitor(`monitors/monitors.json`)承载 —— skill 以 `/feishu-bridge:bridge` 全名被调用时 arm,无参跑 `bin/listener.py` 随 session 常驻、跟随本 CC 实例自动认领其绑定(绑定结束后回等待,再 bind 自动接住);`bind` 等它认领后输出 `listener_claimed`(`false` = 6 秒内未观察到认领:monitor 未 arm / 启动慢 / 启动失败,回退为手动 Monitor 跑 `listener_cmd`,即有参 `bin/listener.py <binding_id>`)。然后在回复文本里原样包含 `[feishu-bridge-bind:<nonce>]` marker(Stop hook 借此确认"输出通道=这个 session")。流程细节见 SKILL.md。
 
 群内行为:
 - 只有 **@bot** 的消息才会被处理(结构化 mentions 判定,不看文本启发式)。
@@ -121,7 +121,7 @@ bind 完整握手需要 CC 侧:起 persistent Monitor 跑 `bin/listener.py <bind
 | ├ `daemon.log` / `hook_drops.log` | daemon 日志 / hook fail-closed 丢弃记录 + StopFailure 告警未送达观测行(轮转,无正文) |
 | └ `media/<binding>/<message>/` | 附件物化(原子 rename;终态消息 7 天后清理) |
 
-代码在 **plugin 根**下:`.claude-plugin/plugin.json`(清单)· `skills/bridge/SKILL.md`(自动发现)· `hooks/hooks.json`(自动加载)+ `hooks/stop_hook.py`/`session_end.py`(只写库)/`stop_failure_hook.py`(联网发 @群主 告警)· `bin/daemon.py`(守护进程)· `bin/listener.py`(Monitor 内)· `bin/bridgectl.py`(CLI)· `lib/*`(核心逻辑)· `schema.sql` · `tests/`。所有 Python 自定位靠 `Path(__file__).resolve().parents[1]` = plugin 根(bin/lib/hooks 均直接位于根下)。
+代码在 **plugin 根**下:`.claude-plugin/plugin.json`(清单)· `skills/bridge/SKILL.md`(自动发现)· `hooks/hooks.json`(自动加载)+ `hooks/stop_hook.py`/`session_end.py`(只写库)/`stop_failure_hook.py`(联网发 @群主 告警)· `monitors/monitors.json`(plugin monitor:skill 调用时 arm 常驻 listener)· `bin/daemon.py`(守护进程)· `bin/listener.py`(listener:无参跟随本 CC 实例 / 有参单绑定)· `bin/bridgectl.py`(CLI)· `lib/*`(核心逻辑)· `schema.sql` · `tests/`。所有 Python 自定位靠 `Path(__file__).resolve().parents[1]` = plugin 根(bin/lib/hooks 均直接位于根下)。
 
 ## 测试
 
