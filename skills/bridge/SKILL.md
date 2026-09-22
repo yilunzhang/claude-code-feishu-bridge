@@ -94,6 +94,7 @@ hooks(Stop/SessionEnd/StopFailure)由 plugin 的 `hooks/hooks.json` **自带**�
      )
      ```
      并告知用户:若是 monitor 没 arm,重启 session 后重新 bind 才能恢复常驻。**这一步要在回复 marker 之前完成**(握手确认后 30 秒内没有 listener 心跳,绑定会被关掉)。
+     **手动起替代进程前先等旧心跳过期(> 6 秒)**:上一个 listener 刚死或刚被 kill 时立刻起新的有参 listener,它会看到旧持有者心跳仍在新鲜窗内、把自己当多余副本**静默退出**(exit 0、无输出);daemon 的判死窗是 30 秒,等 7~10 秒再起即可,接管后同一绑定 epoch+1、仍 active。
 
 5. **回复用户完成握手**:你给用户的**同一条回复文本**里必须原样包含 marker 单独一行(触发 Stop hook 握手确认),并附 banner 提醒。例:
 
