@@ -1,7 +1,8 @@
 """ctxmeter 单元测试(footer-plan v3 §测试节,逐条覆盖)。
 
 被测面(纯函数 + 只读 transcript 尾部):
-  pretty_model / extract_effort / _read_tail(256KiB 有界)/ read_turn_meter(逆序、
+  pretty_model / extract_effort / _read_tail(有界尾读:256KiB 起,窗内无 assistant 记录才扩窗,
+  ≤16MiB 或整文件)/ read_turn_meter(逆序、
   synthetic 跳过、tok<=0 继续、EOF 半写回退、U+2028 不误切、float 归一、nan/inf 守卫)/
   format_footer(rounding、上限、段级 cap)/ footer_for(total 绝不抛)。
 双解释器门禁:本文件须在 3.12 与真 3.9 各全绿(3.9 惰性注解)。
@@ -325,6 +326,53 @@ def test_read_tail_drops_undecodable_line_strict(tmp_path):
     assert good in lines                               # 合法行保留
     assert all("bad" not in l for l in lines)          # 坏行整行丢弃、不在列表(replace 会保留 → 咬住)
     assert all("\ufffd" not in l for l in lines)       # 绝无 U+FFFD 替换字符残留
+
+
+# ---------------------------------------------------------------- 尾读扩窗(窗内无 assistant 才扩;权威屏障跨窗不变)
+def _big_non_assistant_line():
+    # 单条 >300KiB 的非 assistant 记录(实测 compaction 后 CC 曾在末条 assistant 之后追加 370KB 的
+    # type=attachment 记录):256KiB 首窗只含其被截断的尾巴 → json 失败被跳过、窗内无 assistant
+    return json.dumps({"type": "attachment", "blob": "x" * 310000})
+
+
+def test_meter_found_behind_oversized_non_assistant_record(tmp_path):
+    """有效 assistant 记录之后跟一条 >300KiB 非 assistant 记录(超出 256KiB 首窗)→ 扩窗后仍命中 71207。
+    现状 bug:首窗只有截断的 attachment 尾巴 → 无 assistant → None → 页脚静默省略。"""
+    tp = _write(tmp_path,
+                _line(_rec(usage=_usage(inp=71207))),
+                _big_non_assistant_line())
+    meter = ctxmeter.read_turn_meter(tp)
+    assert meter is not None and meter["tokens"] == 71207
+
+
+def test_authority_barrier_holds_across_windows(tmp_path):
+    """扩窗不得削弱权威屏障:[有效] → [损坏 assistant: message=null] → [>300KiB 非 assistant]。
+    首窗无 assistant → 扩窗 → 逆序先命中损坏的权威记录 → None;**不**回退到更旧的有效 71207
+    (锁:现状因首窗找不到也返回 None,本测试咬住的是"扩窗实现不得顺手加回退")。"""
+    tp = _write(tmp_path,
+                _line(_rec(usage=_usage(inp=71207))),                  # 诱饵(不许取)
+                _line({"type": "assistant", "message": None}),         # 最新 assistant turn、损坏
+                _big_non_assistant_line())
+    assert ctxmeter.read_turn_meter(tp) is None
+
+
+def test_no_assistant_anywhere_bounded_reads(monkeypatch):
+    """全窗皆无 assistant → None;锁两个停止条件(插桩 _read_tail 记录 size、getsize 定文件大小):
+    (a) 2.2MB 文件:256K→1M→4M 即覆盖整文件、就此停、不多读一窗;(b) 10GiB:256K→1M→4M→16M 到上限即止。"""
+    sizes = []
+
+    def fake_tail(path, size=ctxmeter._TAIL):
+        sizes.append(size)
+        return ['{"type":"user"}']                     # 窗内只有非 assistant → found=False → 扩窗
+
+    monkeypatch.setattr(ctxmeter, "_read_tail", fake_tail)
+    M = 1024 * 1024
+    for total, expect in ((2_200_000, [ctxmeter._TAIL, 1 * M, 4 * M]),
+                          (10 * 1024 ** 3, [ctxmeter._TAIL, 1 * M, 4 * M, ctxmeter._TAIL_MAX])):
+        sizes.clear()
+        monkeypatch.setattr(ctxmeter.os.path, "getsize", lambda p, t=total: t)
+        assert ctxmeter.read_turn_meter("any.jsonl") is None
+        assert sizes == expect                         # 精确序列:无多余一窗、不超上限
 
 
 # ---------------------------------------------------------------- rounding

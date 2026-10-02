@@ -1,7 +1,8 @@
 """每轮转发页脚的上下文计量(footer-plan v3 §改动面1)。
 
 职责:从 Stop payload + CC transcript 尾部,尽力算出 "🧠 <K> · <模型> · <effort>" 页脚串。
-纯函数,唯一 IO = 只读 transcript 尾部(≤256KiB)。footer_for 是 hooklib 唯一入口、total(绝不抛)。
+纯函数,唯一 IO = 只读 transcript 尾部(256KiB 起;窗内无 assistant 记录才扩窗 1M→4M→16M,上限 16MiB 或整文件)。
+footer_for 是 hooklib 唯一入口、total(绝不抛)。
 
 关键假设(与 footer-plan v3 一致,变更时回看此处):
   个人轻量工具、单用户、群内可信人员;页脚 = best-effort 装饰,取不到/任何异常 → 省略、原样转发。
@@ -13,9 +14,12 @@ from __future__ import annotations
 
 import json
 import math
+import os
 
 SEP = "─" * 12            # 分隔线 = 12×U+2500(字面横线,非 markdown hr)
-_TAIL = 262144                 # 256KiB 尾读上限(实测最大单条 assistant JSONL<130KB)
+_TAIL = 262144                 # 尾读首窗 256KiB(实测最大单条 assistant JSONL<130KB;但非 assistant 记录可达数百 KB,
+                               #   如 compaction 后追加的 370KB type=attachment → 首窗可能一条 assistant 都不含 → 扩窗)
+_TAIL_MAX = 16 * 1024 * 1024   # 尾读窗口上限 16MiB(256K→1M→4M→16M ×4 递增;覆盖整文件或到此即止 → None)
 _MODEL_CAP = 32                # model 段最大字符
 _EFFORT_CAP = 16               # effort 段最大字符
 _MAX_TOKENS = 100_000_000      # token 合理性上限(真实 window≤1M,100M=100x 余量);超则视为异常、省略页脚
@@ -57,8 +61,8 @@ def extract_effort(payload):
     return None
 
 
-def _read_tail(path):
-    """读文件末尾 ≤_TAIL 原始字节(严格 read(_TAIL);期间异步追加的数据留到下一轮 = 符合滞后策略),
+def _read_tail(path, size=_TAIL):
+    """读文件末尾 ≤size 原始字节(默认 _TAIL;严格一次 read(size);期间异步追加的数据留到下一轮 = 符合滞后策略),
     按 b'\\n' 切、逐行**严格** decode('utf-8'):解码失败的行(损坏字节 / 尾部截断的多字节序列)整行丢弃。
     绝不用 errors='ignore'——那会把非法字节删掉、可能把损坏记录"修复"成可信假值(如 9\\xff9999→99999),
     违反"取不到就省略"(codex r2 MINOR2)。返回成功解码的行列表(顺序保留)。
@@ -66,9 +70,9 @@ def _read_tail(path):
     仍作一行进 json.loads;其值里若有这些字符,由 _sanitize 在页脚层剔除,两处一致。"""
     with open(path, "rb") as f:
         f.seek(0, 2)
-        size = f.tell()
-        f.seek(max(0, size - _TAIL))
-        raw = f.read(_TAIL)
+        total = f.tell()
+        f.seek(max(0, total - size))
+        raw = f.read(size)
     lines = []
     for bline in raw.split(b"\n"):
         try:
@@ -93,11 +97,30 @@ def read_turn_meter(transcript_path):
     **假设**:footer 以外层 type=='assistant' 标识 assistant turn(已核实 CC 2.1.x 所有 assistant 记录都有
     type=='assistant')。**故意不做 role 回退**——role 回退曾引入"显式 type=user/null 被损坏 role 劫持"的
     错值边界(codex r4/r5);缺 type 的假想版本下 footer 省略 = 可接受的 fail-safe(best-effort 装饰,不为
-    推测性兼容再冒错值风险)。IO 异常向上冒泡(由 footer_for 的 total 包装兜住)。"""
+    推测性兼容再冒错值风险)。IO 异常向上冒泡(由 footer_for 的 total 包装兜住)。
+    **扩窗**:首窗 _TAIL;若窗内**一条 assistant 记录都没有**(全是非 assistant/半写/synthetic,如 compaction 后
+    追加的 370KB attachment 把末条 assistant 挤出 256KiB)→ 按 ×4 扩窗重扫(1M→4M→16M),直到覆盖整文件或
+    _TAIL_MAX → None。权威屏障跨窗不变:一旦命中最新 assistant 记录即终局,损坏 → None、不扩窗也不回退。"""
     if not transcript_path:
         return None
+    size = _TAIL
+    total = None                          # 只取一次 getsize,且仅在首窗未命中时
+    while True:
+        found, meter = _scan_lines(_read_tail(transcript_path, size))
+        if found:
+            return meter                  # 权威记录(含损坏 → None):终局,不扩窗不回退
+        if total is None:
+            total = os.path.getsize(transcript_path)
+        if size >= total or size >= _TAIL_MAX:
+            return None                   # 已覆盖整文件 / 到上限仍无 assistant → 省略
+        size = min(size * 4, _TAIL_MAX)
+
+
+def _scan_lines(lines):
+    """逆序扫一窗行 → (found, meter)。found=True:命中权威 assistant 记录(meter 为 None = 该记录损坏,
+    调用方必须照 None 返回、不得扩窗找更旧);found=False:窗内无任何 assistant 记录 → 调用方扩窗。"""
     # _read_tail 已逐行严格解码(丢损坏字节行);逆序找最近记录
-    for line in reversed(_read_tail(transcript_path)):
+    for line in reversed(lines):
         line = line.strip()
         if not line:
             continue
@@ -120,12 +143,12 @@ def read_turn_meter(transcript_path):
         if isinstance(m, dict) and m.get("model") == "<synthetic>":
             continue                      # synthetic 标记(带 usage!)非真实 turn → 跳到下面真实 turn
         if not isinstance(m, dict):
-            return None                   # 外层 assistant 但 message 损坏(如 null)→ 省略,不回退(MAJOR)
+            return True, None             # 外层 assistant 但 message 损坏(如 null)→ 省略,不回退(MAJOR)
         if m.get("role") != "assistant":
-            return None                   # role 损坏 → 省略,不回退(MAJOR)
+            return True, None             # role 损坏 → 省略,不回退(MAJOR)
         usage = m.get("usage")
         if not isinstance(usage, dict):
-            return None                   # usage 不可用 → 省略,不回退
+            return True, None             # usage 不可用 → 省略,不回退
         tok = 0
         for key in ("input_tokens", "cache_read_input_tokens",
                     "cache_creation_input_tokens"):
@@ -139,9 +162,9 @@ def read_turn_meter(transcript_path):
                 tok += v
         tok = int(tok)                    # 归一为 int(某字段 1.0 也不让总和变 float 被下游静默吞)
         if tok <= 0:
-            return None                   # 权威记录 tok<=0(不可用)→ 省略页脚,不回退(MAJOR)
-        return {"tokens": tok, "model": m.get("model")}
-    return None
+            return True, None             # 权威记录 tok<=0(不可用)→ 省略页脚,不回退(MAJOR)
+        return True, {"tokens": tok, "model": m.get("model")}
+    return False, None                    # 窗内无 assistant 记录(非 corrupt、是"没找到")→ 调用方扩窗
 
 
 _LINEISH = frozenset((0x85, 0x2028, 0x2029))   # NEL / LS / PS:被 str.splitlines() 当换行拆行
