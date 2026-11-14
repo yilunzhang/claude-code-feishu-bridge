@@ -380,7 +380,7 @@ class Outbound:
             # interactive,不受此影响;通知类(lifecycle/decision/inbound/unsupported)是我们的固定
             # 文案,继续走 --text。
             argv = ["im", "+messages-send", "--as", "bot",
-                    "--chat-id", job["chat_id"], "--markdown", job["body"] or "",
+                    "--chat-id", job["chat_id"], "--markdown", util.literal_arg(job["body"] or ""),
                     "--idempotency-key", wire_key]
         else:
             # 通知类(lifecycle_notice/decision_notice/inbound_notice/unsupported_notice)=固定文案

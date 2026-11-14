@@ -34,11 +34,14 @@ def verify_and_repin(runner, clock, cfg, actual):
 
     重钉**读盘上最新 config**:不拿调用方的旧副本 copy-save,免得覆盖并发写入的 allowlist。
     """
-    # 与 outbound.py::_transmit 的 session_turn 分支同形:--markdown + 幂等键
+    # 与 outbound.py::_transmit 的 session_turn 分支同形:--markdown + literal_arg + 幂等键。
+    # 正文故意以 `@` 开头:CLI 若再改 `@` 的语义、使补过零宽空格的值发送失败,自检先失败、不会重钉
+    # (只能发现导致请求失败的变化;静默改写正文仍会返回 message_id,查不出)。
     res = runner.run(
         ["im", "+messages-send", "--as", "bot",
          "--chat-id", constants.SELFCHECK_CHAT_ID,
-         "--markdown", "feishu-bridge 版本自检 %s(CLI %s)" % (clock.wall_ms(), actual),
+         "--markdown", util.literal_arg(
+             "@feishu-bridge 版本自检 %s(CLI %s)" % (clock.wall_ms(), actual)),
          "--idempotency-key", util.short_key(util.new_id())],
         timeout_s=SEND_TIMEOUT_S)
     env = runner_mod.parse_result(res)          # E4a:stdout 空则回退 stderr

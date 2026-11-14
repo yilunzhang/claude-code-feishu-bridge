@@ -629,6 +629,21 @@ class TestWireFlagsByKind:
         assert "--markdown" not in args and "--text" not in args  # 成员预览绝不 markdown 渲染
 
 
+class TestLiteralBody:
+    """lark-cli ≥1.0.97:`--markdown` 的值以 `@` 开头 = 读本地文件,单独 `-` = 读 stdin。
+    模型输出必须按字面发出 → 这两种开头前补零宽空格(旧版 CLI 同样按字面发,版本无关)。
+    通知类走 `--text` 但全是固定文案,不经此处理。"""
+
+    @pytest.mark.parametrize("body", ["@CLAUDE.md", "-"])
+    def test_at_prefix_and_lone_dash_sent_literally(self, env, body):
+        bid = env.make_binding(status="active")
+        arm_send_ok(env)
+        mk_job(env, binding_id=bid, key="turn:g:0", turn_group="g", chunk_index=0, body=body)
+        env.outbound.tick()
+        args, _ = env.runner.calls_matching("im", "+messages-send")[0]
+        assert args[args.index("--markdown") + 1] == "\u200b" + body
+
+
 # retryable session_turn 持久退避的完整退避时间线(基数 8s、×2、封顶 45s、上限 6 次)
 _RETRY_DELAYS = [8_000, 16_000, 32_000, 45_000, 45_000]  # 尝试 1..5 后的 next_attempt 退避
 

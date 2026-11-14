@@ -27,6 +27,16 @@ def short_key(logical_key):
     return "fb:" + hashlib.sha1(str(logical_key).encode("utf-8")).hexdigest()[:32]
 
 
+def literal_arg(s):
+    """`--markdown/--text` 的值按字面发出。lark-cli ≥1.0.97 把以 `@` 开头的值当本地文件路径读
+    (相对 cwd)、单独 `-` 读 stdin → 正文开头恰好如此时会发不出去或把本机文件发进群。
+    这两种情况前补零宽空格:显示不变,但底层多一个不可见字符(复制出去不再逐字节相同);
+    旧版 CLI 对补过的值同样按字面发 → 与 CLI 版本无关。"""
+    if s.startswith("@") or s == "-":
+        return "​" + s
+    return s
+
+
 def chunk_text(s, limit=constants.CHUNK_LIMIT):
     if not s:
         return []

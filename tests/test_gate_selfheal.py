@@ -76,6 +76,8 @@ class TestSelfHeal:
         assert len(sends) == 1, "应恰好自检发一条"
         argv = sends[0][0]
         assert "--markdown" in argv and "--text" not in argv
+        # 探针正文以 `@` 开头、经与转发同一个字面化处理:CLI 若再改 `@` 语义,自检先失败
+        assert argv[argv.index("--markdown") + 1].startswith("\u200b@")
         assert argv[argv.index("--chat-id") + 1] == constants.SELFCHECK_CHAT_ID
         assert dbmod.get_state(env.conn, "outbound_gate") == "ok"   # 通过 → 开门
         assert configmod.load_config()["cli_version"] == "9.9.9"    # 已重钉
