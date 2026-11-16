@@ -133,10 +133,39 @@ hooks(Stop/SessionEnd/StopFailure)由 plugin 的 `hooks/hooks.json` **自带**�
     被引用的若是转发记录(`merge_forward`)、里面还有 `img_*`/`file_*` 句柄,
     **下载时 `--message-id` 要用被引用那条的 id**(资源挂在它身上,不是当前这条)。
     被引用的常常就是你上一轮的输出(用户直接回复你),那种情况上下文里已有、不必再取。
+  - **`message_type="card_action"`** = owner 本人点了你发的 say 按钮(见下文「让 owner 点按钮决定」),
+    `text` 就是那个按钮代表的那句话,按 owner 本人的指令处理。另带 `card_message_id`(被点的卡片)
+    与 `action_value`(按钮 value 原样)。`message_id` 是合成的 `card:<event_id>`、**不是飞书消息**,
+    只用于去重,别拿它去 mget / 回复。
   - 处理完正常作答即可——你的最终输出会自动转发回群,不用手动回群。
 - `{"type":"farewell","code":…}` → 绑定已结束(unbind/超时/session 判死)。告知用户,不再处理群消息。插件 monitor 的 listener 常驻,重新 bind 会自动接住,**不用停**;若是手动起的有参 Monitor,它会自己退出。
   **例外 `code="no-instance"`**:不是绑定结束,而是常驻 listener 启动失败(定位不到本 CC 实例)且进程已退出,本 session 不会再自动 arm —— 之后要绑定就按 bind 输出的 `listener_cmd` 手动起有参 Monitor,或重启 session。
 - `{"type":"daemon_alert","code":"daemon_down"}` → daemon 拉不起来,提示用户看 `~/.claude/data/feishu-bridge/daemon.log`。
+
+## 让 owner 点按钮决定(card say)
+
+要 owner 在几个选项里定一个时,可以往**本 session 绑定的群**发一张带按钮的卡片,owner 点一下就定。
+按钮 `value` 写 `{"act":"say","text":"<点了等于 owner 说的那句话>"}`(可附加自己的字段,会原样回到
+`action_value`)。owner 点击 → 桥把 `text` 当成 owner 在群里说的话,投进**点击时该群 active 绑定的 session**
+(见上文 `card_action`;群重绑后再点旧卡片,进的是新绑定),并在卡片上打 👀。每次点击各算一句话。
+
+```bash
+lark-cli im +messages-send --as bot --chat-id <绑定群 chat_id> --msg-type interactive \
+  --content '{"config":{"wide_screen_mode":true},"elements":[
+    {"tag":"div","text":{"tag":"lark_md","content":"<要 owner 定的事>"}},
+    {"tag":"action","actions":[
+      {"tag":"button","type":"primary","text":{"tag":"plain_text","content":"A:今晚发版"},
+       "value":{"act":"say","text":"A:今晚发版"}},
+      {"tag":"button","type":"default","text":{"tag":"plain_text","content":"B:明早再发"},
+       "value":{"act":"say","text":"B:明早再发"}}]}]}' \
+  --profile <profile>
+```
+
+- **按钮上显示的字必须和 `text` 一致**(`text` 可以更具体,但不能是另一件事):owner 只看得见按钮上的字,
+  而 `text` 会按 owner 本人的指令执行。
+- 只有 owner 本人的点击生效,其他人点了不投递。`text` 去首尾空白后须非空、≤500 字;该群须有 active 绑定。
+- `chat_id` 用当前绑定群的(群消息通知里的 `chat_id`),`profile` 取 `status` 的 `.fingerprint.profile`。
+- 想在卡片上标出「已选」,可自己用 `lark-cli im messages patch` 改卡片(桥不改)。
 
 ## unbind(立即生效;敏感操作前的逃生门)
 
@@ -173,4 +202,4 @@ python3 "${CLAUDE_SKILL_DIR}/../../bin/bridgectl.py" status
 
 - 输出会进群:不要在回复里打印密钥/token/内网凭证;敏感操作前建议用户先 unbind。
 - 绑定期间**不要**在回复文本里输出形如 `[feishu-bridge-bind:...]` 的字符串(会被 fail-closed 抑制转发)。
-- 普通群侧外发(每轮转发/审批卡/通知)都由 daemon 完成;主动直发例外有两个 = feishu-bridge 的 **notify skill**(blocker → @群主)与 **StopFailure hook**(一轮 API 错误 → @群主 告警),都受 allowlist+身份门+session 三元组门控、只发本 session 绑定群。除本 skill 列出的命令、notify 与该 hook 外,别用 lark-cli 直接往群里发。
+- 普通群侧外发(每轮转发/审批卡/通知)都由 daemon 完成;主动直发例外有三个:feishu-bridge 的 **notify skill**(blocker → @群主)与 **StopFailure hook**(一轮 API 错误 → @群主 告警)都受 allowlist+身份门+session 三元组门控、只发本 session 绑定群;上文的 **card say 卡片**由你直接用 lark-cli 发,同样只能发本 session 绑定群。除本 skill 列出的命令、notify 与该 hook 外,别用 lark-cli 直接往群里发。

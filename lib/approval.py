@@ -7,7 +7,7 @@ import hmac
 import json
 import sqlite3
 
-from . import constants, db, jobs, texts
+from . import constants, db, jobs, texts, util
 
 
 class _Dup(Exception):
@@ -51,6 +51,8 @@ class Approval:
                 av = json.loads(av)
             except ValueError:
                 av = None
+        if isinstance(av, dict) and av.get("act") == constants.SAY_ACT:
+            return self._process_say(ev, av, event_id)   # 与审批卡无关的独立分支
         now = self.clock.wall_ms()
         media_followup = False
         inbox_message_id = None
@@ -132,6 +134,88 @@ class Approval:
                 "SELECT * FROM inbox WHERE message_id=?", (inbox_message_id,)).fetchone()
             self.inbound.drive_row(row)  # 立即物化尝试(网络在事务外;失败由恢复工人接手)
         return "applied"
+
+    # ---------------- card say:owner 点自定义卡片按钮 ----------------
+    def _process_say(self, ev, av, event_id):
+        """owner 点自定义卡片按钮 = owner 在绑定群说了按钮上的那句话。
+        单事务:INSERT callback_events(去重) ∧ 机械校验 ∧ INSERT inbox(直接终态 enqueued)
+        ∧ INSERT deliveries ∧ 卡片上的 👀 回执;无效/重复:仅裸去重,零投递。
+        payload 与普通 owner 文本同形(sender_is_owner=true),另带 card_message_id / action_value;
+        message_id 是合成的 `card:<event_id>`(只用于去重,不是飞书消息)。"""
+        now = self.clock.wall_ms()
+        try:
+            with db.tx(self.conn):
+                try:
+                    self.conn.execute(
+                        "INSERT INTO callback_events(event_id,seen_at) VALUES(?,?)",
+                        (event_id, now))
+                except sqlite3.IntegrityError:
+                    raise _Dup()
+                ctx = self._validate_say_in_tx(ev, av)
+                if ctx is None:
+                    raise _Invalid()
+                binding, text, card_mid = ctx
+                mid = "card:" + str(event_id)
+                operator = ev.get("operator_id")
+                self.conn.execute(
+                    "INSERT INTO inbox(event_id,message_id,chat_id,binding_id,sender_open_id,"
+                    "sender_type,message_type,snapshot_json,state,ts) "
+                    "VALUES(?,?,?,?,?,?,?,?,'enqueued',?)",
+                    (mid, mid, ev["chat_id"], binding["binding_id"], operator, "user",
+                     constants.CARD_ACTION_MSG_TYPE,
+                     util.jdumps({"card_message_id": card_mid, "action_value": av}), now))
+                payload = {
+                    "message_id": mid,
+                    "chat_id": ev["chat_id"],
+                    "sender_open_id": operator,
+                    "sender_type": "user",
+                    "sender_is_owner": True,
+                    "approved_by": None,
+                    "message_type": constants.CARD_ACTION_MSG_TYPE,
+                    "text": text,
+                    "media_paths": [],
+                    "card_message_id": card_mid,
+                    "action_value": av,
+                }
+                cur = self.conn.execute(
+                    "INSERT INTO deliveries(binding_id,message_id,payload_json,state,enq_at) "
+                    "VALUES(?,?,?,'enqueued',?)",
+                    (binding["binding_id"], mid, util.jdumps(payload), now))
+                seq = cur.lastrowid
+                # 👀 打在被点的卡片上(点击已收到的即时反馈);失败即 failed 不重试,不挡队列
+                jobs.create_job(
+                    self.conn, kind="receipt_reaction", chat_id=ev["chat_id"],
+                    binding_id=binding["binding_id"], idempotency_key=jobs.key_rc(seq),
+                    ref_delivery_seq=seq, ref_message_id=card_mid, body="GLANCE", now=now)
+        except _Dup:
+            return "dup"
+        except _Invalid:
+            self._record_bare(event_id)
+            return "invalid"
+        return "said"
+
+    def _validate_say_in_tx(self, ev, av):
+        """机械校验(fail-closed);调用方保证已在写事务内。→ (binding, text, card_message_id) | None"""
+        if ev.get("operator_id") != self.cfg["owner_open_id"]:
+            return None  # 只认 owner 本人点
+        chat_id, card_mid = ev.get("chat_id"), ev.get("message_id")
+        if not chat_id or not card_mid:
+            return None
+        allow = self.cfg.get("chat_allowlist")
+        if allow and chat_id not in allow:
+            return None
+        text = av.get("text")
+        if not isinstance(text, str):
+            return None
+        text = text.strip()
+        if not text or len(text) > constants.SAY_TEXT_MAX:
+            return None
+        binding = self.conn.execute(
+            "SELECT * FROM bindings WHERE chat_id=? AND status='active' "
+            "ORDER BY binding_seq DESC LIMIT 1", (chat_id,)).fetchone()
+        if binding is None:
+            return None  # 只认已绑定且 active 的群(starting/closed 都不投)
+        return binding, text, card_mid
 
     def _record_bare(self, event_id):
         self.conn.execute(

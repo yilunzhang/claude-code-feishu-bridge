@@ -124,6 +124,14 @@ CARD_REARM_BACKOFF_MAX_MS = 10 * 60 * 1000
 # "发了又撤回"的痕迹。自检消息留在此群即可(已有纪律:e2e 测试消息无需善后)。
 SELFCHECK_CHAT_ID = "oc_ef148370df62f0a61e113731c6c50eb3"   # feishu-bridge e2e 测试群(勿动)
 
+# card say:owner 点自定义卡片按钮 = owner 在绑定群说了按钮上的那句话。
+# 按钮 value 形如 {"act": "say", "text": "<那句话>", ...}(与审批卡同用 act 字段分流)。
+# 判定纯机械(approval.Approval._validate_say_in_tx):operator==owner ∧ 该群有 active 绑定
+# ∧ (chat_allowlist) ∧ text 非空且不超长;其余一律 invalid(裸去重,零投递)。
+SAY_ACT = "say"
+SAY_TEXT_MAX = 500
+CARD_ACTION_MSG_TYPE = "card_action"   # 投递 payload 的 message_type;不进 SUPPORTED_MSG_TYPES(那是入站消息的门)
+
 SUPPORTED_MSG_TYPES = ("text", "image", "file", "post")
 MEDIA_MSG_TYPES = ("image", "file")
 # 白名单直投时 payload 的 approved_by 值。**不留 None** —— None 是 owner 本人的语义,

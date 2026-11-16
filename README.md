@@ -14,6 +14,7 @@
   bridge daemon(flock 单例;单线程事件循环;bridge.db=SQLite WAL 唯一持久真相)
     入站:去重→mget 快照(钉死 binding)→结构化@判定→门禁(owner 直投/白名单直投/member 审批卡)→deliveries
     审批:card.action.trigger 回调=单事务(去重+机械校验+CAS+入队/物化+通知)
+    card say:按钮 value act=say 的回调另走一支 —— owner 本人点 + 群有 active 绑定 → 把 text 当 owner 消息直接入队(合成 message_id `card:<event_id>`)
     出站:outbound_jobs per-kind 守卫线性化→argv 发送→契约解析(唯一发送进程)
     存活:cc_gone / listener 心跳租约 两条独立 CAS;恢复工人驱动一切非终态
               ▲ hooks:Stop/SessionEnd 只写库(零网络);StopFailure 联网(API 错误 → @群主 告警)
@@ -21,7 +22,7 @@
   绑定 session(CC 实例)
 ```
 
-不变量(plan §2):未绑定 session 的输出绝不外发(含 bind turn 自身,fail-closed);投递判定零模型参与;普通桥出站(每轮转发/审批卡/通知)经 outbound_jobs 由 daemon 单点发出,**notify skill 与 StopFailure 告警 hook 是受同款门控(allowlist+身份门+session 三元组)的两个显式直发例外**(见「notify 主动通知」「StopFailure API 错误告警」);所有状态推进=带旧状态 CAS。
+不变量(plan §2):未绑定 session 的输出绝不外发(含 bind turn 自身,fail-closed);投递判定零模型参与;普通桥出站(每轮转发/审批卡/通知)经 outbound_jobs 由 daemon 单点发出,**notify skill 与 StopFailure 告警 hook 是受同款门控(allowlist+身份门+session 三元组)的两个显式直发例外**(见「notify 主动通知」「StopFailure API 错误告警」);card say 卡片由 session 按 SKILL.md 直发到本绑定群(不经该门控,点击回来仍走机械门);所有状态推进=带旧状态 CAS。
 
 ## 安装
 
@@ -81,6 +82,7 @@ bind 完整握手需要 CC 侧:listener 由 plugin monitor(`monitors/monitors.js
 - 只有 **@bot** 的消息才会被处理(结构化 mentions 判定,不看文本启发式)。
 - **owner(你)** 的消息直投 session(👀 表情=已排队);**其他成员**的消息先弹审批卡片,owner 点「投递」才进 session,点「忽略」丢弃。
 - **直投白名单**(v1.5.3):`(群, 人)` 双精确匹配命中 `allowlist.json` 的成员**免审批卡直投**,详见 🅘。
+- **card say**:session 往绑定群发带按钮的卡片,按钮 value 写 `{"act":"say","text":"…"}`;**owner 本人**点击 = owner 在群里说了 `text`,投进该群绑定的 session(卡片上打 👀)。其他人点击、群无 active 绑定、`text` 空或超 500 字一律不投递。按钮显示的字须与 `text` 一致(owner 只看得见按钮)。用法见 SKILL.md「让 owner 点按钮决定」。
 - 每轮转发回群的 session 输出末尾带一行**页脚**:`🧠 <上下文K> · <模型> · <effort>`(上方一条分隔线),让你一眼看到该 session 当前 context 占用 / 模型 / effort。详见「已知限制 🅔」。
 - image/file 会下载到本地,payload 给绝对路径;member 附件批准前不下载(**白名单成员除外** —— 已授权,与 owner 同路直接下载)。
 - 未绑定群 @bot → "未绑定"提示;绑定 session 已关 → "已关闭"提示(有冷却限速)。
