@@ -5,6 +5,7 @@ hook_drops.log 固定文案一行(不含正文)+ 计数镜像;双双不可写 �
 allowlist+身份门+session 三元组门控的直发)给绑定群发 @群主 告警(见 stop_failure_entry;fail-closed,
 exit 0,不写心跳)。"""
 import datetime
+import json
 import os
 import re
 import sqlite3
@@ -180,6 +181,16 @@ def run_stop_hook(payload, *, conn, prober, clock, start_pid=None):
         return {"suppressed": True, "reason": "instance-mismatch"}
     if not msg.strip():
         return {"suppressed": False, "reason": "empty-message"}
+    # 语言提醒(旁路):最近一条明确的群消息不是英文、本轮回复几乎全是英文 → 本轮不转发,
+    # 把提醒交给 AI 让它确认/重写;续写那次(stop_hook_active)不再查,保证每轮至多提醒一次。
+    # 检查出错 → 照常转发(fail-open,不让提醒拖垮转发)。
+    if not sha:
+        try:
+            reminder = _language_reminder(conn, b["binding_id"], msg)
+        except Exception:
+            reminder = None
+        if reminder:
+            return {"suppressed": True, "reason": "language-mismatch", "block_reason": reminder}
     chunks = util.chunk_text(msg, constants.CHUNK_LIMIT)
     # 每轮转发页脚(context/model/effort)= best-effort 装饰,完全隔离于转发关键路径(fail-open 铁律):
     #   延迟导入 → 即便 ctxmeter 损坏(如 3.9 导入错)也只丢页脚、不炸 hook(不在顶层 import,把导入面挡在关键路径外);
@@ -205,6 +216,35 @@ def run_stop_hook(payload, *, conn, prober, clock, start_pid=None):
                 turn_group=group, chunk_index=i, body=c, now=now)
     return {"suppressed": False, "reason": "enqueued",
             "turn_group": group, "chunks": len(chunks)}
+
+
+LANG_LOOKBACK = 20   # 往回找「语言明确」的群消息最多看这么多条投递
+
+
+def _language_reminder(conn, binding_id, msg):
+    """→ 提醒文案 | None。最近一条语言明确的投递(owner 或被批准的成员都算)是非英文,
+    而本轮回复几乎全是英文时返回提醒;「A」「可以」这类看不出语言的消息跳过、往前找。"""
+    from . import langcheck
+    if not langcheck.reply_is_english(msg):
+        return None
+    for r in conn.execute(
+            "SELECT payload_json FROM deliveries WHERE binding_id=? "
+            "ORDER BY delivery_seq DESC LIMIT ?", (binding_id, LANG_LOOKBACK)).fetchall():
+        text = (json.loads(r["payload_json"] or "{}") or {}).get("text") or ""
+        lang = langcheck.question_language(text)
+        if lang == "en":
+            return None
+        if lang == "non_en":
+            return texts.LANGUAGE_REMINDER
+    return None
+
+
+def stop_hook_stdout(res):
+    """Stop hook 的 stdout:需要语言提醒时返回 CC 的 block 决定(提醒交给 AI、本轮继续),否则 None。"""
+    reason = (res or {}).get("block_reason")
+    if not reason:
+        return None
+    return json.dumps({"decision": "block", "reason": reason}, ensure_ascii=False)
 
 
 def _handshake(conn, pend, session_id, now):
@@ -410,3 +450,4 @@ def stop_failure_entry(payload, *, prober=None, start_pid=None, notify_fn=None, 
     except Exception as e:
         _fail_closed_drop(e, hook="stop_failure")
         return {"suppressed": True, "reason": "exception"}
+

@@ -106,6 +106,13 @@ def decision_notice_body(outcome):
     return DECISION_NOTICE[outcome]
 
 
+# Stop hook 语言提醒(经 CC 的 block 决定交给 AI;不发到群里)。
+LANGUAGE_REMINDER = (
+    "[feishu-bridge 语言提醒] 群里最近一条消息不是英文,而你这轮的回复几乎全是英文,"
+    "这一版还没有转发到群里。请确认回复语言:应该用对方的语言,就用那种语言把这一轮的完整回复重新写一遍;"
+    "确实该用英文(例如对方要求用英文),就把原回复原样再输出一遍。你接下来的输出会照常转发。")
+
+
 def send_failure_alert_body():
     """出站 session_turn 多次重试后放弃(转 failed 以放行后续)时的可见告警。固定文案(无注入面),
     经 --markdown 发到绑定群,让"丢弃某条消息"不静默。

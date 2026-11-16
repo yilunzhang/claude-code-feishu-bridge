@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """CC Stop hook 入口:stdin JSON → hooklib.stop_hook_entry。
-永远 exit 0(绝不阻塞 CC);一切异常在 hooklib 内 fail-closed。"""
+永远 exit 0;一切异常在 hooklib 内 fail-closed。唯一会让 CC 继续本轮的是语言提醒
+(stdout 输出 block 决定,每轮至多一次)。"""
 import json
 import os
 import pathlib
@@ -18,7 +19,13 @@ def main():
             payload = {}
     except Exception:
         payload = {}
-    hooklib.stop_hook_entry(payload, start_pid=os.getppid())
+    res = hooklib.stop_hook_entry(payload, start_pid=os.getppid())
+    try:
+        out = hooklib.stop_hook_stdout(res)
+        if out:
+            print(out)
+    except Exception:
+        pass
     sys.exit(0)
 
 
